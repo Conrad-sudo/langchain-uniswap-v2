@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "langchain-uniswap-v2"
+version = "0.1.0"
+description = "LangChain tools for querying Uniswap V2 pools: swap quotes, liquidity previews, and LP balances across any EVM chain."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ email = "conrad.japhet@gmail.com" }]
+requires-python = ">=3.10"
+keywords = ["langchain", "uniswap", "web3", "ethereum", "evm", "defi", "agent", "tools"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "web3>=6.0",
+    "langchain-core>=0.3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.15"]
+
+[tool.setuptools.packages.find]
+include = ["langchain_uniswap_v2*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 95
+# abis.py is machine-generated from the original ABI JSON and verified
+# byte-for-byte against it (see summary.md) -- excluded so lint/format never
+# churns it.
+extend-exclude = ["langchain_uniswap_v2/abis.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
