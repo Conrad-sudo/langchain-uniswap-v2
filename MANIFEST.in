@@ -1,0 +1,10 @@
+# Without this file, setuptools' sdist falls back to legacy distutils
+# defaults that partially/incorrectly grab tests/test*.py (but not
+# conftest.py, web3_mocks.py, or tests/__init__.py). Tests aren't part of
+# the installed package, so prune the whole directory instead.
+#
+# (setuptools also unconditionally writes a minimal setup.cfg into every
+# sdist for python-setup.py-based tooling backward-compat, even though this
+# project has none -- that's expected/harmless and not something MANIFEST.in
+# controls.)
+prune tests
