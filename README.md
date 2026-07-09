@@ -1,5 +1,7 @@
 # langchain-uniswap-v2
 
+[![CI](https://github.com/Conrad-sudo/langchain-uniswap-v2/actions/workflows/ci.yml/badge.svg)](https://github.com/Conrad-sudo/langchain-uniswap-v2/actions/workflows/ci.yml)
+
 Read-only [LangChain](https://www.langchain.com/) tools for querying Uniswap V2
 (and Uniswap-V2-shaped fork, e.g. PancakeSwap) pools: swap quotes, liquidity
 previews, and LP token balances — for any EVM chain, given just an RPC URL

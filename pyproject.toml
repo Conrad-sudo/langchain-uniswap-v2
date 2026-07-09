@@ -29,6 +29,10 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "ruff>=0.15"]
 
+[project.urls]
+Repository = "https://github.com/Conrad-sudo/langchain-uniswap-v2"
+Issues = "https://github.com/Conrad-sudo/langchain-uniswap-v2/issues"
+
 [tool.setuptools.packages.find]
 include = ["langchain_uniswap_v2*"]
 
