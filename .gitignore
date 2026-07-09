@@ -26,3 +26,6 @@ htmlcov/
 # Env files (never commit secrets/keys)
 .env
 .env.*
+
+# Internal session/dev notes, not for the public repo
+summary.md
