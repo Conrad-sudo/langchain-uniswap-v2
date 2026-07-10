@@ -8,8 +8,14 @@ Read-only [LangChain](https://www.langchain.com/) tools for querying Uniswap V2
 previews, and LP token balances — for any EVM chain, given just an RPC URL
 and contract addresses.
 
-LangChain ships no blockchain-specific tools out of the box. This package
-fills that gap for the Uniswap V2 AMM shape specifically.
+LangChain's existing blockchain integrations are Coinbase's CDP AgentKit
+(execution-oriented — transfers, trades, deployments — tied to Coinbase's
+own wallet infrastructure) and the Compass DeFi Toolkit (a paid third-party
+API that returns unsigned transactions across several protocols, including
+Uniswap). Neither is a free, permissionless, read-only DEX query toolkit
+that works against any EVM chain given just an RPC URL — no API key, no
+third-party service, no wallet required. This package fills that specific
+gap for the Uniswap V2 AMM shape.
 
 ## Scope
 
