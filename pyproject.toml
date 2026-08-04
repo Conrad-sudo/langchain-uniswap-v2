@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "langchain-uniswap-v2"
-version = "0.1.0"
-description = "LangChain tools for querying Uniswap V2 pools: swap quotes, liquidity previews, and LP balances across any EVM chain."
+version = "0.2.0"
+description = "LangChain tools for Uniswap V2 pools: swap quotes, liquidity previews, LP balances, and unsigned transactions for swaps, approvals, and add/remove liquidity, across any EVM chain."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
