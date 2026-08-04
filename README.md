@@ -74,11 +74,13 @@ tools = toolkit.get_tools()
 #   agent = create_agent(model, tools=tools)
 
 # Or call a tool directly:
-result = tools[1].invoke({  # get_quote_out
-    "token_in": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",   # WETH
-    "token_out": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",  # USDC
-    "amount_in": 1,
-})
+result = tools[1].invoke(
+    {  # get_quote_out
+        "token_in": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",  # WETH
+        "token_out": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",  # USDC
+        "amount_in": 1,
+    }
+)
 # -> {"amount_in": 1.0, "amount_out": <live price>, "path": [...]}
 ```
 

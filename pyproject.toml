@@ -27,7 +27,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "ruff>=0.15"]
+dev = ["pytest>=8.0", "ruff==0.16.1"]
 
 [project.urls]
 Repository = "https://github.com/Conrad-sudo/langchain-uniswap-v2"
