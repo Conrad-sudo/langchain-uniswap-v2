@@ -4,11 +4,23 @@ Contract calls are mocked (see conftest.py / web3_mocks.py) -- these assert
 on the toolkit's own arithmetic/routing logic, not on real on-chain values.
 """
 
+import time
+
 import pytest
 from langchain_core.tools import ToolException
 from web3.exceptions import ContractLogicError
 
-from tests.web3_mocks import OWNER, PAIR, TOKEN_A, TOKEN_B, ZERO_ADDRESS
+import langchain_uniswap_v2.toolkit as uvt
+from tests.web3_mocks import (
+    FACTORY,
+    NATIVE_WRAPPED,
+    OWNER,
+    PAIR,
+    ROUTER,
+    TOKEN_A,
+    TOKEN_B,
+    ZERO_ADDRESS,
+)
 
 
 @pytest.fixture
@@ -20,6 +32,24 @@ def tools(toolkit):
         "get_pool_quote",
         "get_lp_amounts",
         "get_liquidity_token_balance",
+        "is_token_balance_sufficient",
+        "is_native_balance_sufficient",
+        "is_derived_token_input_sufficient",
+        "is_derived_native_input_sufficient",
+        "is_liquidity_sufficient",
+        "is_liquidity_sufficient_eth",
+        "is_liquidity_removal_sufficient",
+        "approve_token",
+        "swap_exact_tokens_for_tokens",
+        "swap_tokens_for_exact_tokens",
+        "swap_exact_eth_for_tokens",
+        "swap_eth_for_exact_tokens",
+        "swap_exact_tokens_for_eth",
+        "swap_tokens_for_exact_eth",
+        "add_liquidity",
+        "add_liquidity_eth",
+        "remove_liquidity",
+        "remove_liquidity_eth",
     }
     return by_name
 
@@ -195,3 +225,574 @@ def test_pair_lookup_is_order_independent(mock_web3, toolkit, tools):
     )
 
     mock_web3.factory.functions.getPair.assert_called_once()
+
+
+def test_is_token_balance_sufficient_true_and_false(mock_web3, toolkit, tools):
+    mock_web3.erc20(TOKEN_A).functions.decimals.return_value.call.return_value = 18
+    mock_web3.erc20(TOKEN_A).functions.balanceOf.return_value.call.return_value = 10**18
+
+    assert (
+        tools["is_token_balance_sufficient"].invoke(
+            {"token_address": TOKEN_A, "amount": 1, "owner_address": OWNER}
+        )
+        is True
+    )
+    assert (
+        tools["is_token_balance_sufficient"].invoke(
+            {"token_address": TOKEN_A, "amount": 1.5, "owner_address": OWNER}
+        )
+        is False
+    )
+
+
+def test_is_native_balance_sufficient_true_and_false(mock_web3, toolkit, tools):
+    mock_web3.w3.eth.get_balance.return_value = 10**18
+
+    assert (
+        tools["is_native_balance_sufficient"].invoke({"amount": 1, "owner_address": OWNER})
+        is True
+    )
+    assert (
+        tools["is_native_balance_sufficient"].invoke({"amount": 1.5, "owner_address": OWNER})
+        is False
+    )
+    call_args = mock_web3.w3.eth.get_balance.call_args[0]
+    assert call_args[0].lower() == OWNER.lower()
+
+
+def test_is_derived_token_input_sufficient(mock_web3, toolkit, tools):
+    mock_web3.erc20(TOKEN_A).functions.decimals.return_value.call.return_value = 18
+    mock_web3.erc20(TOKEN_B).functions.decimals.return_value.call.return_value = 18
+    mock_web3.router.functions.getAmountsIn.return_value.call.return_value = [
+        3 * 10**18,
+        10**18,
+        10**18,
+    ]
+    required_base = 3 * 10**18 * 10050 // 10000
+    mock_web3.erc20(TOKEN_A).functions.balanceOf.return_value.call.return_value = required_base
+
+    result = tools["is_derived_token_input_sufficient"].invoke(
+        {
+            "token_in": TOKEN_A,
+            "token_out": TOKEN_B,
+            "amount_out": 1,
+            "owner_address": OWNER,
+        }
+    )
+
+    assert result["is_sufficient"] is True
+    assert result["required_input"] == required_base / 10**18
+
+    mock_web3.erc20(TOKEN_A).functions.balanceOf.return_value.call.return_value = (
+        required_base - 1
+    )
+    result = tools["is_derived_token_input_sufficient"].invoke(
+        {
+            "token_in": TOKEN_A,
+            "token_out": TOKEN_B,
+            "amount_out": 1,
+            "owner_address": OWNER,
+        }
+    )
+    assert result["is_sufficient"] is False
+
+
+def test_is_derived_native_input_sufficient(mock_web3, toolkit, tools):
+    mock_web3.erc20(TOKEN_B).functions.decimals.return_value.call.return_value = 18
+    mock_web3.router.functions.getAmountsIn.return_value.call.return_value = [
+        2 * 10**18,
+        10**18,
+    ]
+    required_base = 2 * 10**18 * 10050 // 10000
+    mock_web3.w3.eth.get_balance.return_value = required_base
+
+    result = tools["is_derived_native_input_sufficient"].invoke(
+        {"token_out": TOKEN_B, "amount_out": 1, "owner_address": OWNER}
+    )
+
+    assert result["is_sufficient"] is True
+    assert result["required_input"] == required_base / 10**18
+
+
+def test_is_liquidity_sufficient(mock_web3, toolkit, tools):
+    pair = _configure_pair(mock_web3)
+    pair.functions.getReserves.return_value.call.return_value = (1000, 2000, 0)
+    mock_web3.erc20(TOKEN_A).functions.decimals.return_value.call.return_value = 18
+    mock_web3.erc20(TOKEN_B).functions.decimals.return_value.call.return_value = 18
+    mock_web3.router.functions.quote.return_value.call.return_value = 2 * 10**18
+    mock_web3.erc20(TOKEN_A).functions.balanceOf.return_value.call.return_value = 10**18
+    mock_web3.erc20(TOKEN_B).functions.balanceOf.return_value.call.return_value = 2 * 10**18
+
+    result = tools["is_liquidity_sufficient"].invoke(
+        {"token_a": TOKEN_A, "amount_a": 1, "token_b": TOKEN_B, "owner_address": OWNER}
+    )
+    assert result["is_sufficient"] is True
+    assert result["required_b"] == 2.0
+
+    mock_web3.erc20(TOKEN_B).functions.balanceOf.return_value.call.return_value = 10**18 - 1
+    result = tools["is_liquidity_sufficient"].invoke(
+        {"token_a": TOKEN_A, "amount_a": 1, "token_b": TOKEN_B, "owner_address": OWNER}
+    )
+    assert result["is_sufficient"] is False
+
+
+def test_is_liquidity_sufficient_eth(mock_web3, toolkit, tools):
+    pair = _configure_pair(mock_web3, token_a=TOKEN_A)
+    pair.functions.getReserves.return_value.call.return_value = (1000, 2000, 0)
+    mock_web3.erc20(TOKEN_A).functions.decimals.return_value.call.return_value = 18
+    mock_web3.router.functions.quote.return_value.call.return_value = 3 * 10**18
+    mock_web3.erc20(TOKEN_A).functions.balanceOf.return_value.call.return_value = 10**18
+    mock_web3.w3.eth.get_balance.return_value = 3 * 10**18
+
+    result = tools["is_liquidity_sufficient_eth"].invoke(
+        {"token": TOKEN_A, "amount_token": 1, "owner_address": OWNER}
+    )
+    assert result["is_sufficient"] is True
+    assert result["required_native"] == 3.0
+
+
+def test_is_liquidity_removal_sufficient(mock_web3, toolkit, tools):
+    pair = _configure_pair(mock_web3)
+    pair.functions.decimals.return_value.call.return_value = 18
+    pair.functions.balanceOf.return_value.call.return_value = 5 * 10**18
+
+    assert (
+        tools["is_liquidity_removal_sufficient"].invoke(
+            {"token_a": TOKEN_A, "token_b": TOKEN_B, "lp_amount": 5, "owner_address": OWNER}
+        )
+        is True
+    )
+    assert (
+        tools["is_liquidity_removal_sufficient"].invoke(
+            {"token_a": TOKEN_A, "token_b": TOKEN_B, "lp_amount": 5.1, "owner_address": OWNER}
+        )
+        is False
+    )
+
+
+def test_approve_token_builds_unsigned_tx(mock_web3, toolkit, tools):
+    mock_web3.erc20(TOKEN_A).functions.decimals.return_value.call.return_value = 18
+    mock_web3.w3.eth.get_transaction_count.return_value = 7
+    mock_web3.w3.eth.chain_id = 1
+    expected_tx = {
+        "to": TOKEN_A,
+        "data": "0xabc",
+        "value": 0,
+        "nonce": 7,
+        "chainId": 1,
+        "gas": 50000,
+    }
+    mock_web3.erc20(
+        TOKEN_A
+    ).functions.approve.return_value.build_transaction.return_value = expected_tx
+
+    result = tools["approve_token"].invoke(
+        {
+            "token_address": TOKEN_A,
+            "spender_address": ROUTER,
+            "amount": 100,
+            "from_address": OWNER,
+        }
+    )
+
+    assert result == expected_tx
+    mock_web3.erc20(TOKEN_A).functions.approve.assert_called_once()
+    call_args = mock_web3.erc20(TOKEN_A).functions.approve.call_args[0]
+    assert call_args[0].lower() == ROUTER.lower()
+    assert call_args[1] == 100 * 10**18
+    mock_web3.w3.eth.get_transaction_count.assert_called_once_with(OWNER, "pending")
+
+
+def test_approve_token_respects_explicit_nonce(mock_web3, toolkit, tools):
+    mock_web3.erc20(TOKEN_A).functions.decimals.return_value.call.return_value = 18
+    mock_web3.w3.eth.chain_id = 1
+    build_tx_mock = mock_web3.erc20(TOKEN_A).functions.approve.return_value.build_transaction
+
+    tools["approve_token"].invoke(
+        {
+            "token_address": TOKEN_A,
+            "spender_address": ROUTER,
+            "amount": 1,
+            "from_address": OWNER,
+            "nonce": 42,
+        }
+    )
+
+    mock_web3.w3.eth.get_transaction_count.assert_not_called()
+    tx_params = build_tx_mock.call_args[0][0]
+    assert tx_params["nonce"] == 42
+
+
+def test_approve_token_raises_tool_exception_when_build_would_revert(
+    mock_web3, toolkit, tools
+):
+    mock_web3.erc20(TOKEN_A).functions.decimals.return_value.call.return_value = 18
+    mock_web3.w3.eth.get_transaction_count.return_value = 0
+    mock_web3.w3.eth.chain_id = 1
+    mock_web3.erc20(
+        TOKEN_A
+    ).functions.approve.return_value.build_transaction.side_effect = ContractLogicError(
+        "execution reverted"
+    )
+
+    with pytest.raises(ToolException):
+        tools["approve_token"].invoke(
+            {
+                "token_address": TOKEN_A,
+                "spender_address": ROUTER,
+                "amount": 1,
+                "from_address": OWNER,
+            }
+        )
+
+
+def test_swap_exact_tokens_for_tokens_builds_unsigned_tx(mock_web3, toolkit, tools):
+    mock_web3.erc20(TOKEN_A).functions.decimals.return_value.call.return_value = 18
+    mock_web3.router.functions.getAmountsOut.return_value.call.return_value = [
+        10**18,
+        5 * 10**17,
+        2_500_000,
+    ]
+    mock_web3.w3.eth.get_transaction_count.return_value = 3
+    mock_web3.w3.eth.chain_id = 1
+    expected_tx = {"to": ROUTER, "data": "0xdead", "nonce": 3, "chainId": 1, "value": 0}
+    build_tx_mock = (
+        mock_web3.router.functions.swapExactTokensForTokens.return_value.build_transaction
+    )
+    build_tx_mock.return_value = expected_tx
+
+    before = int(time.time())
+    result = tools["swap_exact_tokens_for_tokens"].invoke(
+        {
+            "token_in": TOKEN_A,
+            "token_out": TOKEN_B,
+            "amount_in": 1,
+            "from_address": OWNER,
+        }
+    )
+
+    assert result == expected_tx
+    call_args = mock_web3.router.functions.swapExactTokensForTokens.call_args[0]
+    amount_in_arg, amount_out_min_arg, path_arg, to_arg, deadline_arg = call_args
+    assert amount_in_arg == 10**18
+    assert amount_out_min_arg == 2_500_000 * 9950 // 10000
+    assert path_arg[0].lower() == TOKEN_A.lower()
+    assert path_arg[-1].lower() == TOKEN_B.lower()
+    assert to_arg.lower() == OWNER.lower()
+    assert deadline_arg >= before + 600
+    tx_params = build_tx_mock.call_args[0][0]
+    assert tx_params["value"] == 0
+    assert tx_params["nonce"] == 3
+    mock_web3.w3.eth.get_transaction_count.assert_called_once_with(OWNER, "pending")
+
+
+def test_swap_exact_tokens_for_tokens_raises_on_no_liquidity(mock_web3, toolkit, tools):
+    mock_web3.erc20(TOKEN_A).functions.decimals.return_value.call.return_value = 18
+    mock_web3.router.functions.getAmountsOut.return_value.call.side_effect = (
+        ContractLogicError("execution reverted")
+    )
+
+    with pytest.raises(ToolException):
+        tools["swap_exact_tokens_for_tokens"].invoke(
+            {
+                "token_in": TOKEN_A,
+                "token_out": TOKEN_B,
+                "amount_in": 1,
+                "from_address": OWNER,
+            }
+        )
+
+
+def test_swap_tokens_for_exact_tokens_builds_unsigned_tx(mock_web3, toolkit, tools):
+    mock_web3.erc20(TOKEN_B).functions.decimals.return_value.call.return_value = 18
+    mock_web3.router.functions.getAmountsIn.return_value.call.return_value = [
+        3 * 10**18,
+        10**18,
+        10**18,
+    ]
+    expected_tx = {"to": ROUTER, "data": "0xbeef"}
+    build_tx_mock = (
+        mock_web3.router.functions.swapTokensForExactTokens.return_value.build_transaction
+    )
+    build_tx_mock.return_value = expected_tx
+
+    result = tools["swap_tokens_for_exact_tokens"].invoke(
+        {
+            "token_in": TOKEN_A,
+            "token_out": TOKEN_B,
+            "amount_out": 1,
+            "from_address": OWNER,
+        }
+    )
+
+    assert result == expected_tx
+    call_args = mock_web3.router.functions.swapTokensForExactTokens.call_args[0]
+    amount_out_arg, amount_in_max_arg, _path_arg, to_arg, _deadline = call_args
+    assert amount_out_arg == 10**18
+    assert amount_in_max_arg == 3 * 10**18 * 10050 // 10000
+    assert to_arg.lower() == OWNER.lower()
+
+
+def test_swap_exact_eth_for_tokens_sets_value(mock_web3, toolkit, tools):
+    mock_web3.router.functions.getAmountsOut.return_value.call.return_value = [
+        10**18,
+        2_000_000,
+    ]
+    expected_tx = {"to": ROUTER, "value": 10**18}
+    build_tx_mock = (
+        mock_web3.router.functions.swapExactETHForTokens.return_value.build_transaction
+    )
+    build_tx_mock.return_value = expected_tx
+
+    result = tools["swap_exact_eth_for_tokens"].invoke(
+        {"token_out": TOKEN_B, "amount_in": 1, "from_address": OWNER}
+    )
+
+    assert result == expected_tx
+    call_args = mock_web3.router.functions.swapExactETHForTokens.call_args[0]
+    amount_out_min_arg, path_arg, to_arg, _deadline = call_args
+    assert amount_out_min_arg == 2_000_000 * 9950 // 10000
+    assert path_arg[0].lower() == NATIVE_WRAPPED.lower()
+    assert path_arg[-1].lower() == TOKEN_B.lower()
+    tx_params = build_tx_mock.call_args[0][0]
+    assert tx_params["value"] == 10**18
+
+
+def test_swap_eth_for_exact_tokens_sets_value_to_amount_in_max(mock_web3, toolkit, tools):
+    mock_web3.erc20(TOKEN_B).functions.decimals.return_value.call.return_value = 18
+    mock_web3.router.functions.getAmountsIn.return_value.call.return_value = [
+        2 * 10**18,
+        10**18,
+    ]
+    expected_tx = {"to": ROUTER}
+    build_tx_mock = (
+        mock_web3.router.functions.swapETHForExactTokens.return_value.build_transaction
+    )
+    build_tx_mock.return_value = expected_tx
+
+    result = tools["swap_eth_for_exact_tokens"].invoke(
+        {"token_out": TOKEN_B, "amount_out": 1, "from_address": OWNER}
+    )
+
+    assert result == expected_tx
+    tx_params = build_tx_mock.call_args[0][0]
+    assert tx_params["value"] == 2 * 10**18 * 10050 // 10000
+
+
+def test_swap_exact_tokens_for_eth_no_value_sent(mock_web3, toolkit, tools):
+    mock_web3.erc20(TOKEN_A).functions.decimals.return_value.call.return_value = 18
+    mock_web3.router.functions.getAmountsOut.return_value.call.return_value = [
+        10**18,
+        5 * 10**17,
+    ]
+    expected_tx = {"to": ROUTER}
+    build_tx_mock = (
+        mock_web3.router.functions.swapExactTokensForETH.return_value.build_transaction
+    )
+    build_tx_mock.return_value = expected_tx
+
+    result = tools["swap_exact_tokens_for_eth"].invoke(
+        {"token_in": TOKEN_A, "amount_in": 1, "from_address": OWNER}
+    )
+
+    assert result == expected_tx
+    call_args = mock_web3.router.functions.swapExactTokensForETH.call_args[0]
+    assert call_args[2][-1].lower() == NATIVE_WRAPPED.lower()
+    tx_params = build_tx_mock.call_args[0][0]
+    assert tx_params["value"] == 0
+
+
+def test_swap_tokens_for_exact_eth_no_value_sent(mock_web3, toolkit, tools):
+    mock_web3.router.functions.getAmountsIn.return_value.call.return_value = [
+        3 * 10**18,
+        10**18,
+    ]
+    expected_tx = {"to": ROUTER}
+    build_tx_mock = (
+        mock_web3.router.functions.swapTokensForExactETH.return_value.build_transaction
+    )
+    build_tx_mock.return_value = expected_tx
+
+    result = tools["swap_tokens_for_exact_eth"].invoke(
+        {"token_in": TOKEN_A, "amount_out": 1, "from_address": OWNER}
+    )
+
+    assert result == expected_tx
+    tx_params = build_tx_mock.call_args[0][0]
+    assert tx_params["value"] == 0
+
+
+def test_add_liquidity_builds_unsigned_tx(mock_web3, toolkit, tools):
+    pair = _configure_pair(mock_web3)
+    pair.functions.getReserves.return_value.call.return_value = (1000, 2000, 0)
+    mock_web3.erc20(TOKEN_A).functions.decimals.return_value.call.return_value = 18
+    mock_web3.router.functions.quote.return_value.call.return_value = 2 * 10**18
+    expected_tx = {"to": ROUTER}
+    build_tx_mock = mock_web3.router.functions.addLiquidity.return_value.build_transaction
+    build_tx_mock.return_value = expected_tx
+
+    result = tools["add_liquidity"].invoke(
+        {"token_a": TOKEN_A, "token_b": TOKEN_B, "amount_a": 1, "from_address": OWNER}
+    )
+
+    assert result == expected_tx
+    call_args = mock_web3.router.functions.addLiquidity.call_args[0]
+    (
+        _token_a_arg,
+        _token_b_arg,
+        amount_a_desired_arg,
+        amount_b_desired_arg,
+        amount_a_min_arg,
+        amount_b_min_arg,
+        to_arg,
+        _deadline,
+    ) = call_args
+    assert amount_a_desired_arg == 10**18
+    assert amount_b_desired_arg == 2 * 10**18
+    assert amount_a_min_arg == 10**18 * 9950 // 10000
+    assert amount_b_min_arg == 2 * 10**18 * 9950 // 10000
+    assert to_arg.lower() == OWNER.lower()
+
+
+def test_add_liquidity_eth_sets_value_to_derived_eth_amount(mock_web3, toolkit, tools):
+    pair = _configure_pair(mock_web3, token_a=TOKEN_A)
+    pair.functions.getReserves.return_value.call.return_value = (1000, 2000, 0)
+    mock_web3.erc20(TOKEN_A).functions.decimals.return_value.call.return_value = 18
+    mock_web3.router.functions.quote.return_value.call.return_value = 3 * 10**18
+    expected_tx = {"to": ROUTER}
+    build_tx_mock = mock_web3.router.functions.addLiquidityETH.return_value.build_transaction
+    build_tx_mock.return_value = expected_tx
+
+    result = tools["add_liquidity_eth"].invoke(
+        {"token": TOKEN_A, "amount_token": 1, "from_address": OWNER}
+    )
+
+    assert result == expected_tx
+    call_args = mock_web3.router.functions.addLiquidityETH.call_args[0]
+    (
+        _token_arg,
+        amount_token_desired_arg,
+        _amount_token_min_arg,
+        amount_eth_min_arg,
+        to_arg,
+        _deadline,
+    ) = call_args
+    assert amount_token_desired_arg == 10**18
+    assert amount_eth_min_arg == 3 * 10**18 * 9950 // 10000
+    assert to_arg.lower() == OWNER.lower()
+    tx_params = build_tx_mock.call_args[0][0]
+    assert tx_params["value"] == 3 * 10**18
+
+
+def test_remove_liquidity_builds_unsigned_tx(mock_web3, toolkit, tools):
+    pair = _configure_pair(mock_web3)
+    pair.functions.decimals.return_value.call.return_value = 18
+    pair.functions.getReserves.return_value.call.return_value = (1000, 2000, 0)
+    pair.functions.totalSupply.return_value.call.return_value = 100
+    expected_tx = {"to": ROUTER}
+    build_tx_mock = mock_web3.router.functions.removeLiquidity.return_value.build_transaction
+    build_tx_mock.return_value = expected_tx
+
+    result = tools["remove_liquidity"].invoke(
+        {
+            "token_a": TOKEN_A,
+            "token_b": TOKEN_B,
+            "lp_amount": 10 / 10**18,
+            "from_address": OWNER,
+        }
+    )
+
+    assert result == expected_tx
+    call_args = mock_web3.router.functions.removeLiquidity.call_args[0]
+    (
+        _token_a_arg,
+        _token_b_arg,
+        liquidity_arg,
+        amount_a_min_arg,
+        amount_b_min_arg,
+        to_arg,
+        _deadline,
+    ) = call_args
+    assert liquidity_arg == 10
+    # raw0 = 10*1000//100 = 100, raw1 = 10*2000//100 = 200; token0 == TOKEN_A
+    assert amount_a_min_arg == 100 * 9950 // 10000
+    assert amount_b_min_arg == 200 * 9950 // 10000
+    assert to_arg.lower() == OWNER.lower()
+
+
+def test_remove_liquidity_eth_builds_unsigned_tx(mock_web3, toolkit, tools):
+    pair = _configure_pair(mock_web3, token_a=TOKEN_A)
+    pair.functions.decimals.return_value.call.return_value = 18
+    pair.functions.getReserves.return_value.call.return_value = (1000, 2000, 0)
+    pair.functions.totalSupply.return_value.call.return_value = 100
+    expected_tx = {"to": ROUTER}
+    build_tx_mock = (
+        mock_web3.router.functions.removeLiquidityETH.return_value.build_transaction
+    )
+    build_tx_mock.return_value = expected_tx
+
+    result = tools["remove_liquidity_eth"].invoke(
+        {"token": TOKEN_A, "lp_amount": 10 / 10**18, "from_address": OWNER}
+    )
+
+    assert result == expected_tx
+    call_args = mock_web3.router.functions.removeLiquidityETH.call_args[0]
+    (
+        _token_arg,
+        liquidity_arg,
+        amount_token_min_arg,
+        amount_eth_min_arg,
+        to_arg,
+        _deadline,
+    ) = call_args
+    assert liquidity_arg == 10
+    assert amount_token_min_arg == 100 * 9950 // 10000
+    assert amount_eth_min_arg == 200 * 9950 // 10000
+    assert to_arg.lower() == OWNER.lower()
+
+
+@pytest.mark.parametrize(
+    "tool_name, kwargs",
+    [
+        (
+            "swap_exact_eth_for_tokens",
+            {"token_out": TOKEN_B, "amount_in": 1, "from_address": OWNER},
+        ),
+        (
+            "swap_eth_for_exact_tokens",
+            {"token_out": TOKEN_B, "amount_out": 1, "from_address": OWNER},
+        ),
+        (
+            "swap_exact_tokens_for_eth",
+            {"token_in": TOKEN_A, "amount_in": 1, "from_address": OWNER},
+        ),
+        (
+            "swap_tokens_for_exact_eth",
+            {"token_in": TOKEN_A, "amount_out": 1, "from_address": OWNER},
+        ),
+        (
+            "add_liquidity_eth",
+            {"token": TOKEN_A, "amount_token": 1, "from_address": OWNER},
+        ),
+        (
+            "remove_liquidity_eth",
+            {"token": TOKEN_A, "lp_amount": 1, "from_address": OWNER},
+        ),
+        (
+            "is_derived_native_input_sufficient",
+            {"token_out": TOKEN_B, "amount_out": 1, "owner_address": OWNER},
+        ),
+        (
+            "is_liquidity_sufficient_eth",
+            {"token": TOKEN_A, "amount_token": 1, "owner_address": OWNER},
+        ),
+    ],
+)
+def test_native_asset_tools_require_native_wrapped_address(mock_web3, tool_name, kwargs):
+    no_native_toolkit = uvt.UniswapV2Toolkit(
+        rpc_url="http://fake-rpc", router_address=ROUTER, factory_address=FACTORY
+    )
+    tools = {t.name: t for t in no_native_toolkit.get_tools()}
+
+    with pytest.raises(ToolException, match="native_wrapped_address"):
+        tools[tool_name].invoke(kwargs)
