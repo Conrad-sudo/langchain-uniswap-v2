@@ -17,7 +17,7 @@ import pytest
 from web3 import Web3 as RealWeb3
 
 import langchain_uniswap_v2.toolkit as uvt
-from tests.web3_mocks import FACTORY, NATIVE_WRAPPED, ROUTER, Web3Env
+from tests.web3_mocks import FACTORY, NATIVE_WRAPPED, ROUTER, ZERO_ADDRESS, Web3Env
 
 
 @pytest.fixture
@@ -32,6 +32,12 @@ def mock_web3(monkeypatch):
 
     env = Web3Env(mock_w3_cls, w3_instance)
     w3_instance.eth.contract.side_effect = env._contract_side_effect
+    # _build_path calls factory.getPair to check for a direct pair before
+    # falling back to a wrapped-native hop. Default to "no direct pair" so
+    # existing tests that never configured this keep routing through
+    # native_wrapped as before; a test exercising the direct-pair path sets
+    # env.factory.functions.getPair(...).call.return_value explicitly.
+    env.factory.functions.getPair.return_value.call.return_value = ZERO_ADDRESS
 
     monkeypatch.setattr(uvt, "Web3", mock_w3_cls)
     return env

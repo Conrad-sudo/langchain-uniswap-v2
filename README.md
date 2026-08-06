@@ -5,9 +5,9 @@
 
 [LangChain](https://www.langchain.com/) tools for Uniswap V2 (and
 Uniswap-V2-shaped forks, e.g. PancakeSwap): live swap quotes, liquidity
-previews, LP token balances, and unsigned transactions for swaps, approvals,
-and add/remove liquidity — for any EVM chain, given just an RPC URL and
-contract addresses.
+previews, LP token balances, and execution plans for swaps, approvals, and
+add/remove liquidity — ready for an EOA to sign or a smart-contract wallet
+to batch, on any EVM chain, given just an RPC URL and contract addresses.
 
 LangChain's existing blockchain integrations are Coinbase's CDP AgentKit
 (execution-oriented — transfers, trades, deployments — tied to Coinbase's
@@ -23,11 +23,10 @@ AMM shape.
 This package never holds a private key, a signer, or any wallet state, and
 it never signs or submits a transaction. Read tools (quotes, liquidity
 previews, balances) only make RPC calls. Write tools (approvals, swaps,
-add/remove liquidity) build and return a plain **unsigned transaction
-dict** — the caller signs and submits it with whatever wallet
-infrastructure they already have (a local key, a KMS-backed signer, a
-smart-contract wallet). See [Write tools](#write-tools-unsigned-transactions)
-below.
+add/remove liquidity) build and return an **execution plan** — an ordered
+list of account-agnostic contract calls, ready for an EOA to sign or a
+smart-contract wallet to batch. See [Execution modes](#execution-modes) and
+[Write tools](#write-tools-execution-plans) below.
 
 ## Install
 
@@ -88,6 +87,90 @@ result = tools[1].invoke(
 the registry's default is a free public endpoint, fine for prototyping but
 rate-limited. Pass your own (Alchemy, Infura, etc.) for production use.
 
+A second example, for a smart-contract wallet consuming calls directly
+instead of signing EOA transactions:
+
+```python
+scw_toolkit = UniswapV2Toolkit.for_chain(chain_id=1, tx_mode="calls")
+scw_tools = {t.name: t for t in scw_toolkit.get_tools()}
+
+plan = scw_tools["swap_exact_tokens_for_tokens"].invoke(
+    {
+        "token_in": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",  # WETH
+        "token_out": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",  # USDC
+        "amount_in": 1,
+        "from_address": "0xYourSmartAccount...",
+    }
+)
+# plan["transactions"] is None -- zero nonce/gas/fee RPC calls were made.
+executions = [(c["to"], c["value"], bytes.fromhex(c["data"][2:])) for c in plan["calls"]]
+# feed `executions` into your account's own batch executor, e.g. an
+# ERC-7579 execute(mode, abi.encode(executions)) call.
+```
+
+## Execution modes
+
+Every write tool returns a **plan**, not a bare transaction:
+
+```python
+{
+    "calls": [  # always present, ordered -- execute all of them
+        {"to": "0x...", "value": 0, "data": "0x...", "role": "approve", "description": "..."},
+        {
+            "to": "0x...router",
+            "value": 0,
+            "data": "0x...",
+            "role": "swap",
+            "description": "...",
+        },
+    ],
+    "transactions": [...] | None,  # EOA mode only; same calls, signable, nonces assigned
+    "chain_id": 1,
+    "summary": {...},  # amounts in whole units, safe to show a user
+}
+```
+
+- **`tx_mode="eoa"`** (the default) also renders `plan["transactions"]`: the
+  same calls as unsigned, signable transactions with sequential nonces
+  already assigned. Sign and broadcast them in order.
+- **`tx_mode="calls"`** returns `calls` only (`transactions` is `None`) and
+  makes **zero** nonce/gas/fee RPC calls — for a smart-contract wallet's own
+  batch executor.
+
+`calls` is the smallest primitive both audiences agree on: an EOA
+transaction is `(to, value, data)` plus nonce/gas/fees; an ERC-7579
+`Execution` is exactly `(to, value, data)`. Execute every call in a plan, in
+order — if your account supports batching, execute them atomically in one
+transaction. That atomicity is what makes the approve → action → reset
+sequence safe for accounts that reject standing approvals.
+
+**`gas_estimated` caveat (EOA mode):** a call whose prerequisite approval is
+earlier in the same plan can't be simulated yet — the allowance isn't
+on-chain until that earlier call is mined. For those, the transaction's
+`gas` field falls back to a static per-role default (`DEFAULT_GAS`) and
+`gas_estimated` is set to `False`, flagging that the limit wasn't derived
+from a live simulation and should be sanity-checked before broadcast. Only
+the **first** call in a plan has its revert treated as fatal — if that one
+fails to estimate, the tool raises `ToolException` instead of returning a
+plan that would fail on-chain. `gas_estimated` is metadata, not a
+transaction field — pop it (or move it into a parallel list) before
+signing.
+
+**Constructor options**, all keyword-only:
+
+| Param | Default | Meaning |
+|---|---|---|
+| `tx_mode` | `"eoa"` | `"eoa"` also renders `transactions`. `"calls"` returns calls only. |
+| `estimate_gas` | `True` | EOA mode only. `False` uses `default_gas` for every call, skipping live `eth_estimateGas`. |
+| `gas_buffer` | `1.25` | Multiplier applied to a successful gas estimate. |
+| `default_gas` | `None` | Per-role fallback gas limits, merged over the module's `DEFAULT_GAS`. |
+| `reset_residual_approvals` | `None` | Append a trailing zero-approval where needed (see [Write tools](#write-tools-execution-plans)). Defaults to `True` in `"calls"` mode, `False` in `"eoa"` mode. |
+| `preflight` | `True` | Run the matching balance-sufficiency check before building, raising `ToolException` (naming the shortfall) if it fails. |
+
+`UniswapV2Toolkit.for_chain(chain_id, rpc_url=None, **kwargs)` forwards
+`**kwargs` to the constructor, so e.g.
+`UniswapV2Toolkit.for_chain(1, tx_mode="calls", preflight=False)` works.
+
 ## Tools
 
 All tools take plain contract addresses as arguments — no ticker→address
@@ -103,15 +186,18 @@ registry is assumed.
 | `get_lp_amounts(token_a, token_b, lp_amount)` | Expected token amounts redeemable for a given amount of LP tokens, before removing liquidity. |
 | `get_liquidity_token_balance(owner_address, token_a, token_b)` | An address's LP token balance for a given pair. |
 
-If `native_wrapped_address` is configured, quotes between two non-native
-tokens are routed through it (2-hop → 3-hop path), matching how Uniswap V2
-pools are typically seeded. Without it, quotes always use a direct path.
+For a `token_in`/`token_out` pair, a direct pool is used when one exists and
+has liquidity; otherwise, if `native_wrapped_address` is configured, the
+quote routes through it (2-hop → 3-hop path), matching how Uniswap V2 pools
+are typically seeded.
 
 Balance-sufficiency checks answer "does this address hold enough" before a
 write tool would actually be called, given an explicit `owner_address` —
 useful for an agent to check before spending gas building/submitting a
-transaction that would just revert. Each mirrors the balance requirement of
-one or two write tools below:
+transaction that would just revert. Every write tool below already runs its
+matching check automatically before building (see `preflight` above); these
+tools are for checking ahead of time or with `preflight=False`. Each mirrors
+the balance requirement of one or two write tools below:
 
 | Tool | Checks balance for |
 |---|---|
@@ -123,31 +209,40 @@ one or two write tools below:
 | `is_liquidity_sufficient_eth(token, amount_token, owner_address)` | `add_liquidity_eth`. |
 | `is_liquidity_removal_sufficient(token_a, token_b, lp_amount, owner_address)` | `remove_liquidity` / `remove_liquidity_eth` — LP token balance. |
 
-### Write tools (unsigned transactions)
+### Write tools (execution plans)
 
-Every write tool returns a plain transaction dict (`to`, `data`, `value`,
-`gas`, `nonce`, `chainId`, ...) built via `web3.py`'s `build_transaction` —
-nothing is signed or sent. Each takes an explicit `from_address` (used to
-read the nonce and set as the recipient of swap/liquidity output), and none
-of them require a session key, a signer object, or any wallet state on the
-toolkit itself.
+Every write tool below includes its own approval call(s) in the plan
+automatically, sized to what that call actually needs — you no longer need
+to call `approve_token` first. `approve_token` remains available for
+explicit/manual control (e.g. granting an allowance outside of any swap or
+deposit flow, or to a spender other than this toolkit's router), and takes
+an `unlimited=True` option for the standard effectively-unlimited approval
+instead of passing an arbitrary large `amount`.
 
-| Tool | Purpose |
-|---|---|
-| `approve_token(token_address, spender_address, amount, from_address)` | Unsigned ERC20 `approve`. Needed before any tool below that pulls tokens from `from_address` — approve and act are always separate transactions here, since there's no session-key-style atomic batching to lean on. |
-| `swap_exact_tokens_for_tokens` / `swap_tokens_for_exact_tokens` | Token-for-token swaps, exact-input or exact-output. |
-| `swap_exact_eth_for_tokens` / `swap_eth_for_exact_tokens` | Native-asset-for-token swaps (requires `native_wrapped_address`). |
-| `swap_exact_tokens_for_eth` / `swap_tokens_for_exact_eth` | Token-for-native-asset swaps (requires `native_wrapped_address`). |
-| `add_liquidity` / `add_liquidity_eth` | Deposit into a pool; the paired amount is derived from live reserves so the deposit matches the current pool ratio. |
-| `remove_liquidity` / `remove_liquidity_eth` | Burn LP tokens for both underlying tokens, using live reserves to compute expected returns. |
+| Tool | Approves | Reset needed |
+|---|---|---|
+| `approve_token(token_address, spender_address, from_address, amount=0, unlimited=False)` | is itself the approval | — |
+| `swap_exact_tokens_for_tokens` / `swap_exact_tokens_for_eth` | `token_in`, the exact amount sold | no — exact pull |
+| `swap_tokens_for_exact_tokens` / `swap_tokens_for_exact_eth` | `token_in`, the derived max | yes, when the router pulls less |
+| `swap_exact_eth_for_tokens` / `swap_eth_for_exact_tokens` | — (native value, no approval needed) | — |
+| `add_liquidity` / `add_liquidity_eth` | the token(s) deposited | yes — pool ratio may consume less |
+| `remove_liquidity` / `remove_liquidity_eth` | the pair's own LP token, the exact amount burned | no — exact pull |
 
-All amount-based write tools take `slippage_bps` (default `50` = 0.5%) and
-derive `amountOutMin`/`amountInMax`/equivalent from a live on-chain quote,
-plus `deadline_secs` (default `600`) for the transaction's on-chain expiry
-— both are always explicit, never silently applied. Every write tool also
-accepts an optional `nonce` override, useful when building more than one
-unsigned transaction in sequence (e.g. `approve_token` then a swap) before
-submitting either, so the two nonces don't collide.
+"Reset needed" means: when the router may pull less than it was approved
+for, the plan appends a trailing `approve(spender, 0)` call — but only when
+`reset_residual_approvals` is enabled (see [Execution modes](#execution-modes)).
+Tools that always pull their exact approved amount never append one,
+regardless of that setting, since there is nothing left to clear.
+
+All amount-based write tools also take `slippage_bps` (default `50` = 0.5%)
+and derive `amountOutMin`/`amountInMax`/equivalent from a live on-chain
+quote, and `deadline_secs` (default `600`) for the plan's on-chain expiry —
+both are always explicit, never silently applied. Every write tool also
+takes an optional `recipient` (defaults to `from_address`) for the output of
+the call — the account executing the plan and the account receiving the
+result don't have to be the same address — and an optional `nonce`: the
+*starting* nonce for the plan in EOA mode (later calls increment from it
+automatically), ignored entirely in `"calls"` mode.
 
 "ETH" in tool/parameter names is a generic internal label for the chain's
 native asset (ETH, BNB, etc.) — it works identically on every supported
@@ -182,6 +277,33 @@ registry points there instead.
 
 For any chain not listed here, instantiate `UniswapV2Toolkit(...)` directly
 with explicit `router_address` / `factory_address` / `native_wrapped_address`.
+
+## Migration (0.2.0 → 0.3.0)
+
+Read tools are unchanged. Write tools now return an execution plan instead
+of a bare transaction dict:
+
+| 0.2.0 | 0.3.0 |
+|---|---|
+| `tx = tool.invoke(...)` → bare tx dict | `plan = tool.invoke(...)` → plan dict |
+| `sign(tx)` | `for tx in plan["transactions"]: sign(tx)` |
+| caller calls `approve_token` separately | approval is `plan["calls"][0]`, already sized |
+| caller manages `nonce` collisions | nonces pre-assigned across the plan |
+| caller re-quotes to describe the swap | `plan["summary"]` |
+| build raises when allowance missing | builds fine; `gas_estimated: False` flags fallbacks |
+
+Minimal EOA diff:
+
+```diff
+-tx = tools["swap_exact_tokens_for_tokens"].invoke({...})
+-signed = acct.sign_transaction(tx)
+-w3.eth.send_raw_transaction(signed.raw_transaction)
++plan = tools["swap_exact_tokens_for_tokens"].invoke({...})
++for tx in plan["transactions"]:
++    tx.pop("gas_estimated", None)
++    signed = acct.sign_transaction(tx)
++    w3.eth.send_raw_transaction(signed.raw_transaction)
+```
 
 ## Development
 

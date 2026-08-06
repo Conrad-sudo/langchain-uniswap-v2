@@ -1,9 +1,11 @@
 import pytest
+from langchain_core.tools import ToolException
 from web3 import Web3 as RealWeb3
+from web3.exceptions import ContractLogicError, MismatchedABI
 
 import langchain_uniswap_v2.toolkit as uvt
 from langchain_uniswap_v2.networks import KNOWN_NETWORKS
-from tests.web3_mocks import FACTORY, NATIVE_WRAPPED, ROUTER, TOKEN_A, TOKEN_B
+from tests.web3_mocks import FACTORY, NATIVE_WRAPPED, PAIR, ROUTER, TOKEN_A, TOKEN_B
 
 
 def test_constructor_raises_when_rpc_not_connected(mock_web3):
@@ -57,6 +59,51 @@ def test_constructor_checksums_native_wrapped_address(mock_web3):
         native_wrapped_address=NATIVE_WRAPPED.lower(),
     )
     assert toolkit.native_wrapped_address == RealWeb3.to_checksum_address(NATIVE_WRAPPED)
+
+
+def test_constructor_reset_residual_approvals_defaults_false_in_eoa_mode(mock_web3):
+    toolkit = uvt.UniswapV2Toolkit(
+        rpc_url="http://fake-rpc", router_address=ROUTER, factory_address=FACTORY
+    )
+    assert toolkit.reset_residual_approvals is False
+
+
+def test_constructor_reset_residual_approvals_defaults_true_in_calls_mode(mock_web3):
+    toolkit = uvt.UniswapV2Toolkit(
+        rpc_url="http://fake-rpc",
+        router_address=ROUTER,
+        factory_address=FACTORY,
+        tx_mode="calls",
+    )
+    assert toolkit.reset_residual_approvals is True
+
+
+def test_constructor_reset_residual_approvals_explicit_override_wins(mock_web3):
+    toolkit = uvt.UniswapV2Toolkit(
+        rpc_url="http://fake-rpc",
+        router_address=ROUTER,
+        factory_address=FACTORY,
+        tx_mode="calls",
+        reset_residual_approvals=False,
+    )
+    assert toolkit.reset_residual_approvals is False
+
+
+def test_constructor_preflight_defaults_true(mock_web3):
+    toolkit = uvt.UniswapV2Toolkit(
+        rpc_url="http://fake-rpc", router_address=ROUTER, factory_address=FACTORY
+    )
+    assert toolkit.preflight is True
+
+
+def test_constructor_preflight_can_be_disabled(mock_web3):
+    toolkit = uvt.UniswapV2Toolkit(
+        rpc_url="http://fake-rpc",
+        router_address=ROUTER,
+        factory_address=FACTORY,
+        preflight=False,
+    )
+    assert toolkit.preflight is False
 
 
 def test_for_chain_unknown_chain_id_raises(mock_web3):
@@ -116,6 +163,24 @@ def test_for_chain_rpc_url_override_takes_priority(mock_web3, monkeypatch):
     mock_web3.mock_w3_cls.HTTPProvider.assert_any_call("http://override-rpc")
 
 
+def test_for_chain_passes_kwargs_through_to_constructor(mock_web3, monkeypatch):
+    monkeypatch.setitem(
+        KNOWN_NETWORKS,
+        999,
+        {
+            "name": "test-chain",
+            "rpc_url": "http://registry-rpc",
+            "router": ROUTER,
+            "factory": FACTORY,
+            "native_wrapped": NATIVE_WRAPPED,
+            "native_token": "TEST",
+        },
+    )
+    toolkit = uvt.UniswapV2Toolkit.for_chain(chain_id=999, tx_mode="calls", preflight=False)
+    assert toolkit.tx_mode == "calls"
+    assert toolkit.preflight is False
+
+
 @pytest.mark.parametrize(
     "amount, decimals, expected",
     [
@@ -151,6 +216,33 @@ def test_build_path_routes_through_native_wrapped(toolkit):
     ]
 
 
+def test_build_path_prefers_direct_pair_when_liquid(mock_web3, toolkit):
+    mock_web3.factory.functions.getPair.return_value.call.return_value = PAIR
+    pair = mock_web3.pair(PAIR)
+    pair.functions.getReserves.return_value.call.return_value = (1000, 2000, 0)
+
+    path = toolkit._build_path(TOKEN_A, TOKEN_B)
+
+    assert path == [
+        RealWeb3.to_checksum_address(TOKEN_A),
+        RealWeb3.to_checksum_address(TOKEN_B),
+    ]
+
+
+def test_build_path_falls_back_to_native_wrapped_when_direct_pair_is_dry(mock_web3, toolkit):
+    mock_web3.factory.functions.getPair.return_value.call.return_value = PAIR
+    pair = mock_web3.pair(PAIR)
+    pair.functions.getReserves.return_value.call.return_value = (0, 0, 0)
+
+    path = toolkit._build_path(TOKEN_A, TOKEN_B)
+
+    assert path == [
+        RealWeb3.to_checksum_address(TOKEN_A),
+        RealWeb3.to_checksum_address(NATIVE_WRAPPED),
+        RealWeb3.to_checksum_address(TOKEN_B),
+    ]
+
+
 def test_build_path_direct_when_token_in_is_native_wrapped(toolkit):
 
     path = toolkit._build_path(NATIVE_WRAPPED, TOKEN_B)
@@ -167,3 +259,196 @@ def test_build_path_direct_when_token_out_is_native_wrapped(toolkit):
         RealWeb3.to_checksum_address(TOKEN_A),
         RealWeb3.to_checksum_address(NATIVE_WRAPPED),
     ]
+
+
+def test_call_builds_account_agnostic_call_via_pure_encoding(mock_web3, toolkit):
+    erc20 = mock_web3.erc20(TOKEN_A)
+    erc20.address = RealWeb3.to_checksum_address(TOKEN_A)
+    erc20.encode_abi.return_value = "0xabc123"
+
+    call = toolkit._call(
+        erc20,
+        "approve",
+        [ROUTER, 100],
+        value=0,
+        role="approve",
+        description="Approve router to spend 100",
+    )
+
+    assert call == {
+        "to": RealWeb3.to_checksum_address(TOKEN_A),
+        "value": 0,
+        "data": "0xabc123",
+        "role": "approve",
+        "description": "Approve router to spend 100",
+    }
+    erc20.encode_abi.assert_called_once_with(
+        abi_element_identifier="approve", args=[ROUTER, 100]
+    )
+    # Pure ABI encoding -- must never touch the network.
+    mock_web3.w3.eth.get_transaction_count.assert_not_called()
+    mock_web3.w3.eth.estimate_gas.assert_not_called()
+    assert erc20.functions.mock_calls == []
+
+
+def test_call_wraps_encoder_errors_in_tool_exception(mock_web3, toolkit):
+    erc20 = mock_web3.erc20(TOKEN_A)
+    erc20.address = RealWeb3.to_checksum_address(TOKEN_A)
+    erc20.encode_abi.side_effect = MismatchedABI("value not compatible with type uint256")
+
+    with pytest.raises(ToolException):
+        toolkit._call(
+            erc20,
+            "approve",
+            [ROUTER, 2**300],
+            role="approve",
+            description="Approve router to spend an out-of-range amount",
+        )
+
+
+def test_default_gas_uses_module_constant_by_role(toolkit):
+    assert toolkit._default_gas({"role": "swap"}) == uvt.DEFAULT_GAS["swap"]
+
+
+def test_default_gas_respects_constructor_override(mock_web3):
+    toolkit = uvt.UniswapV2Toolkit(
+        rpc_url="http://fake-rpc",
+        router_address=ROUTER,
+        factory_address=FACTORY,
+        default_gas={"swap": 999_999},
+    )
+    assert toolkit._default_gas({"role": "swap"}) == 999_999
+    # Unrelated roles still fall back to the module default.
+    assert toolkit._default_gas({"role": "approve"}) == uvt.DEFAULT_GAS["approve"]
+
+
+def test_fee_params_eip1559_when_base_fee_present(mock_web3, toolkit):
+    mock_web3.w3.eth.get_block.return_value = {"baseFeePerGas": 1000}
+    mock_web3.w3.eth.max_priority_fee = 2
+
+    fees = toolkit._fee_params()
+
+    assert fees == {"maxFeePerGas": 1000 * 2 + 2, "maxPriorityFeePerGas": 2}
+    mock_web3.w3.eth.get_block.assert_called_once_with("latest")
+
+
+def test_fee_params_legacy_when_no_base_fee(mock_web3, toolkit):
+    mock_web3.w3.eth.get_block.return_value = {}
+    mock_web3.w3.eth.gas_price = 42
+
+    fees = toolkit._fee_params()
+
+    assert fees == {"gasPrice": 42}
+
+
+def test_gas_for_uses_default_when_estimate_gas_disabled(mock_web3):
+    toolkit = uvt.UniswapV2Toolkit(
+        rpc_url="http://fake-rpc",
+        router_address=ROUTER,
+        factory_address=FACTORY,
+        estimate_gas=False,
+    )
+    call = {"to": ROUTER, "value": 0, "data": "0xdead", "role": "swap"}
+
+    gas, estimated = toolkit._gas_for(call, ROUTER, has_pending_prerequisite=False)
+
+    assert gas == uvt.DEFAULT_GAS["swap"]
+    assert estimated is False
+    mock_web3.w3.eth.estimate_gas.assert_not_called()
+
+
+def test_gas_for_uses_live_estimate_with_buffer(mock_web3, toolkit):
+    mock_web3.w3.eth.estimate_gas.return_value = 100_000
+    call = {"to": ROUTER, "value": 0, "data": "0xdead", "role": "swap"}
+
+    gas, estimated = toolkit._gas_for(call, ROUTER, has_pending_prerequisite=False)
+
+    assert gas == int(100_000 * toolkit.gas_buffer)
+    assert estimated is True
+
+
+def test_gas_for_falls_back_when_prerequisite_pending(mock_web3, toolkit):
+    mock_web3.w3.eth.estimate_gas.side_effect = ContractLogicError("execution reverted")
+    call = {"to": ROUTER, "value": 0, "data": "0xdead", "role": "swap"}
+
+    gas, estimated = toolkit._gas_for(call, ROUTER, has_pending_prerequisite=True)
+
+    assert gas == uvt.DEFAULT_GAS["swap"]
+    assert estimated is False
+
+
+def test_gas_for_raises_when_first_call_reverts(mock_web3, toolkit):
+    mock_web3.w3.eth.estimate_gas.side_effect = ContractLogicError("execution reverted")
+    call = {"to": ROUTER, "value": 0, "data": "0xdead", "role": "swap"}
+
+    with pytest.raises(ToolException):
+        toolkit._gas_for(call, ROUTER, has_pending_prerequisite=False)
+
+
+def test_render_eoa_assigns_sequential_nonces_and_shared_fees(mock_web3, toolkit):
+    mock_web3.w3.eth.get_transaction_count.return_value = 5
+    mock_web3.w3.eth.chain_id = 1
+    mock_web3.w3.eth.get_block.return_value = {"baseFeePerGas": 100}
+    mock_web3.w3.eth.max_priority_fee = 1
+    mock_web3.w3.eth.estimate_gas.return_value = 21_000
+
+    calls = [
+        {"to": TOKEN_A, "value": 0, "data": "0x1", "role": "approve"},
+        {"to": ROUTER, "value": 0, "data": "0x2", "role": "swap"},
+    ]
+    txs = toolkit._render_eoa(calls, TOKEN_A)
+
+    assert [tx["nonce"] for tx in txs] == [5, 6]
+    assert all(tx["chainId"] == 1 for tx in txs)
+    assert all(tx["maxFeePerGas"] == 201 for tx in txs)  # 100*2 + 1, shared across both
+    assert all(tx["gas_estimated"] is True for tx in txs)
+    mock_web3.w3.eth.get_transaction_count.assert_called_once_with(
+        RealWeb3.to_checksum_address(TOKEN_A), "pending"
+    )
+
+
+def test_render_eoa_respects_explicit_starting_nonce(mock_web3, toolkit):
+    mock_web3.w3.eth.get_block.return_value = {}
+    mock_web3.w3.eth.gas_price = 1
+    mock_web3.w3.eth.estimate_gas.return_value = 21_000
+
+    calls = [
+        {"to": TOKEN_A, "value": 0, "data": "0x1", "role": "approve"},
+        {"to": ROUTER, "value": 0, "data": "0x2", "role": "swap"},
+    ]
+    txs = toolkit._render_eoa(calls, TOKEN_A, nonce=42)
+
+    assert [tx["nonce"] for tx in txs] == [42, 43]
+    mock_web3.w3.eth.get_transaction_count.assert_not_called()
+
+
+def test_plan_renders_transactions_in_eoa_mode(mock_web3, toolkit):
+    mock_web3.w3.eth.get_block.return_value = {}
+    mock_web3.w3.eth.gas_price = 1
+    mock_web3.w3.eth.estimate_gas.return_value = 21_000
+    mock_web3.w3.eth.chain_id = 1
+
+    calls = [{"to": ROUTER, "value": 0, "data": "0x1", "role": "swap"}]
+    plan = toolkit._plan(calls, from_address=TOKEN_A, summary={"amount": 1})
+
+    assert plan["calls"] is calls
+    assert plan["chain_id"] == 1
+    assert plan["summary"] == {"amount": 1}
+    assert len(plan["transactions"]) == 1
+
+
+def test_plan_calls_mode_makes_no_eoa_rpc_calls(mock_web3):
+    toolkit = uvt.UniswapV2Toolkit(
+        rpc_url="http://fake-rpc",
+        router_address=ROUTER,
+        factory_address=FACTORY,
+        tx_mode="calls",
+    )
+    calls = [{"to": ROUTER, "value": 0, "data": "0x1", "role": "swap"}]
+
+    plan = toolkit._plan(calls, from_address=TOKEN_A, summary={})
+
+    assert plan["calls"] is calls
+    assert plan["transactions"] is None
+    mock_web3.w3.eth.get_transaction_count.assert_not_called()
+    mock_web3.w3.eth.estimate_gas.assert_not_called()

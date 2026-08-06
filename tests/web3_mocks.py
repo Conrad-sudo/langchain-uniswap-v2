@@ -32,7 +32,12 @@ class Web3Env:
     def _contract_side_effect(self, address, abi):
         key = (address, id(abi))
         if key not in self._contracts:
-            self._contracts[key] = MagicMock(name=f"contract[{address}]")
+            mock = MagicMock(name=f"contract[{address}]")
+            # Real Contract objects always expose .address -- _call() reads
+            # it directly (contract.address), unlike the balance/decimals
+            # calls elsewhere that go through .functions.
+            mock.address = address
+            self._contracts[key] = mock
         return self._contracts[key]
 
     def contract_for(self, address: str, abi: list) -> MagicMock:
