@@ -5,7 +5,7 @@ from web3.exceptions import ContractLogicError, MismatchedABI
 
 import langchain_uniswap_v2.toolkit as uvt
 from langchain_uniswap_v2.networks import KNOWN_NETWORKS
-from tests.web3_mocks import FACTORY, NATIVE_WRAPPED, PAIR, ROUTER, TOKEN_A, TOKEN_B
+from tests.web3_mocks import FACTORY, NATIVE_WRAPPED, ROUTER, TOKEN_A, TOKEN_B
 
 
 def test_constructor_raises_when_rpc_not_connected(mock_web3):
@@ -181,6 +181,86 @@ def test_for_chain_passes_kwargs_through_to_constructor(mock_web3, monkeypatch):
     assert toolkit.preflight is False
 
 
+@pytest.fixture
+def registry_entry(monkeypatch):
+    """Registers chain 999 in KNOWN_NETWORKS for the duration of a test."""
+    monkeypatch.setitem(
+        KNOWN_NETWORKS,
+        999,
+        {
+            "name": "test-chain",
+            "rpc_url": "http://registry-rpc",
+            "router": ROUTER,
+            "factory": FACTORY,
+            "native_wrapped": NATIVE_WRAPPED,
+            "native_token": "TEST",
+        },
+    )
+
+
+# The registry supplies router/factory/native_wrapped, but a caller must be
+# able to override any of them -- for a stale entry, or a fork reusing a chain
+# id. Passing them explicitly *and* splatting **kwargs used to raise
+# TypeError("got multiple values for keyword argument"), closing that door.
+
+
+def test_for_chain_native_wrapped_address_override(mock_web3, registry_entry):
+    override = "0x" + "99" * 20
+
+    toolkit = uvt.UniswapV2Toolkit.for_chain(chain_id=999, native_wrapped_address=override)
+
+    assert toolkit.native_wrapped_address == RealWeb3.to_checksum_address(override)
+
+
+def test_for_chain_router_address_override(mock_web3, registry_entry):
+    override = "0x" + "aa" * 20
+
+    toolkit = uvt.UniswapV2Toolkit.for_chain(chain_id=999, router_address=override)
+
+    assert toolkit.router.address == RealWeb3.to_checksum_address(override)
+
+
+def test_for_chain_factory_address_override(mock_web3, registry_entry):
+    override = "0x" + "bb" * 20
+
+    toolkit = uvt.UniswapV2Toolkit.for_chain(chain_id=999, factory_address=override)
+
+    assert toolkit.factory.address == RealWeb3.to_checksum_address(override)
+
+
+def test_for_chain_all_three_addresses_overridden_at_once(mock_web3, registry_entry):
+    router, factory, wrapped = "0x" + "aa" * 20, "0x" + "bb" * 20, "0x" + "99" * 20
+
+    toolkit = uvt.UniswapV2Toolkit.for_chain(
+        chain_id=999,
+        router_address=router,
+        factory_address=factory,
+        native_wrapped_address=wrapped,
+    )
+
+    assert toolkit.router.address == RealWeb3.to_checksum_address(router)
+    assert toolkit.factory.address == RealWeb3.to_checksum_address(factory)
+    assert toolkit.native_wrapped_address == RealWeb3.to_checksum_address(wrapped)
+
+
+def test_for_chain_without_overrides_still_uses_registry_values(mock_web3, registry_entry):
+    """setdefault must not change behaviour for callers passing no override."""
+    toolkit = uvt.UniswapV2Toolkit.for_chain(chain_id=999)
+
+    assert toolkit.router.address == RealWeb3.to_checksum_address(ROUTER)
+    assert toolkit.factory.address == RealWeb3.to_checksum_address(FACTORY)
+    assert toolkit.native_wrapped_address == RealWeb3.to_checksum_address(NATIVE_WRAPPED)
+
+
+@pytest.mark.parametrize("chain_id", list(KNOWN_NETWORKS))
+def test_for_chain_configures_native_wrapped_for_every_known_chain(mock_web3, chain_id):
+    """Every registry entry must produce a toolkit that can build native-asset
+    swaps -- a None native_wrapped leaves eight tools registered but raising."""
+    toolkit = uvt.UniswapV2Toolkit.for_chain(chain_id=chain_id)
+
+    assert toolkit.native_wrapped_address is not None
+
+
 @pytest.mark.parametrize(
     "amount, decimals, expected",
     [
@@ -194,71 +274,135 @@ def test_to_base_units(amount, decimals, expected):
     assert uvt.UniswapV2Toolkit._to_base_units(amount, decimals) == expected
 
 
-def test_build_path_direct_when_no_native_wrapped_configured(mock_web3):
+def checksummed(*addresses: str) -> list[str]:
+    return [RealWeb3.to_checksum_address(address) for address in addresses]
+
+
+DIRECT = (TOKEN_A, TOKEN_B)
+HOPPED = (TOKEN_A, NATIVE_WRAPPED, TOKEN_B)
+
+
+def test_candidate_paths_direct_only_when_no_native_wrapped_configured(mock_web3):
     toolkit = uvt.UniswapV2Toolkit(
         rpc_url="http://fake-rpc", router_address=ROUTER, factory_address=FACTORY
     )
 
-    path = toolkit._build_path(TOKEN_A, TOKEN_B)
-    assert path == [
-        RealWeb3.to_checksum_address(TOKEN_A),
-        RealWeb3.to_checksum_address(TOKEN_B),
+    assert toolkit._candidate_paths(TOKEN_A, TOKEN_B) == [checksummed(*DIRECT)]
+
+
+def test_candidate_paths_offers_direct_first_then_the_hop(toolkit):
+    """Direct must come first: an exact tie is kept by the earlier candidate,
+    and one pool beats two for the same output."""
+    assert toolkit._candidate_paths(TOKEN_A, TOKEN_B) == [
+        checksummed(*DIRECT),
+        checksummed(*HOPPED),
     ]
 
 
-def test_build_path_routes_through_native_wrapped(toolkit):
-
-    path = toolkit._build_path(TOKEN_A, TOKEN_B)
-    assert path == [
-        RealWeb3.to_checksum_address(TOKEN_A),
-        RealWeb3.to_checksum_address(NATIVE_WRAPPED),
-        RealWeb3.to_checksum_address(TOKEN_B),
+def test_candidate_paths_direct_only_when_token_in_is_native_wrapped(toolkit):
+    assert toolkit._candidate_paths(NATIVE_WRAPPED, TOKEN_B) == [
+        checksummed(NATIVE_WRAPPED, TOKEN_B)
     ]
 
 
-def test_build_path_prefers_direct_pair_when_liquid(mock_web3, toolkit):
-    mock_web3.factory.functions.getPair.return_value.call.return_value = PAIR
-    pair = mock_web3.pair(PAIR)
-    pair.functions.getReserves.return_value.call.return_value = (1000, 2000, 0)
-
-    path = toolkit._build_path(TOKEN_A, TOKEN_B)
-
-    assert path == [
-        RealWeb3.to_checksum_address(TOKEN_A),
-        RealWeb3.to_checksum_address(TOKEN_B),
+def test_candidate_paths_direct_only_when_token_out_is_native_wrapped(toolkit):
+    assert toolkit._candidate_paths(TOKEN_A, NATIVE_WRAPPED) == [
+        checksummed(TOKEN_A, NATIVE_WRAPPED)
     ]
 
 
-def test_build_path_falls_back_to_native_wrapped_when_direct_pair_is_dry(mock_web3, toolkit):
-    mock_web3.factory.functions.getPair.return_value.call.return_value = PAIR
-    pair = mock_web3.pair(PAIR)
-    pair.functions.getReserves.return_value.call.return_value = (0, 0, 0)
+def test_route_out_prefers_the_hop_when_a_dust_direct_pair_quotes_worse(mock_web3, toolkit):
+    """The regression test for the dust-pool bug: the direct pair exists and
+    holds non-zero reserves -- enough for the old boolean check to select it
+    -- but returns 34% less than the wrapped-native route. Numbers are the
+    measured Avalanche USDC->USDT case, in 6-decimal base units."""
+    mock_web3.set_amounts_out(
+        {DIRECT: [1_000_000, 495_672], HOPPED: [1_000_000, 10**16, 750_485]}
+    )
 
-    path = toolkit._build_path(TOKEN_A, TOKEN_B)
+    path, amounts = toolkit._route_out(
+        1_000_000, TOKEN_A, TOKEN_B, label_in="USDC", label_out="USDT"
+    )
 
-    assert path == [
-        RealWeb3.to_checksum_address(TOKEN_A),
-        RealWeb3.to_checksum_address(NATIVE_WRAPPED),
-        RealWeb3.to_checksum_address(TOKEN_B),
-    ]
-
-
-def test_build_path_direct_when_token_in_is_native_wrapped(toolkit):
-
-    path = toolkit._build_path(NATIVE_WRAPPED, TOKEN_B)
-    assert path == [
-        RealWeb3.to_checksum_address(NATIVE_WRAPPED),
-        RealWeb3.to_checksum_address(TOKEN_B),
-    ]
+    assert path == checksummed(*HOPPED)
+    assert amounts[-1] == 750_485
 
 
-def test_build_path_direct_when_token_out_is_native_wrapped(toolkit):
+def test_route_out_keeps_the_direct_pair_when_it_quotes_better(mock_web3, toolkit):
+    mock_web3.set_amounts_out(
+        {DIRECT: [1_000_000, 998_000], HOPPED: [1_000_000, 10**16, 750_485]}
+    )
 
-    path = toolkit._build_path(TOKEN_A, NATIVE_WRAPPED)
-    assert path == [
-        RealWeb3.to_checksum_address(TOKEN_A),
-        RealWeb3.to_checksum_address(NATIVE_WRAPPED),
-    ]
+    path, amounts = toolkit._route_out(
+        1_000_000, TOKEN_A, TOKEN_B, label_in="USDC", label_out="USDT"
+    )
+
+    assert path == checksummed(*DIRECT)
+    assert amounts[-1] == 998_000
+
+
+def test_route_out_breaks_an_exact_tie_towards_the_direct_pair(mock_web3, toolkit):
+    """Same output either way -- take the single hop: less gas, and less that
+    can move between quoting and execution."""
+    mock_web3.set_amounts_out(
+        {DIRECT: [1_000_000, 900_000], HOPPED: [1_000_000, 10**16, 900_000]}
+    )
+
+    path, _amounts = toolkit._route_out(
+        1_000_000, TOKEN_A, TOKEN_B, label_in="USDC", label_out="USDT"
+    )
+
+    assert path == checksummed(*DIRECT)
+
+
+def test_route_out_falls_back_to_the_hop_when_no_direct_pair_exists(mock_web3, toolkit):
+    mock_web3.set_amounts_out({HOPPED: [1_000_000, 10**16, 750_485]})
+
+    path, _amounts = toolkit._route_out(
+        1_000_000, TOKEN_A, TOKEN_B, label_in="USDC", label_out="USDT"
+    )
+
+    assert path == checksummed(*HOPPED)
+
+
+def test_route_out_raises_the_usual_exception_when_every_candidate_reverts(mock_web3, toolkit):
+    mock_web3.set_amounts_out({})
+
+    with pytest.raises(ToolException, match="No Uniswap V2 liquidity path found"):
+        toolkit._route_out(1_000_000, TOKEN_A, TOKEN_B, label_in="USDC", label_out="USDT")
+
+
+def test_route_in_prefers_the_path_needing_the_least_input(mock_web3, toolkit):
+    """Exact-output is the mirror image: lower amounts[0] wins."""
+    mock_web3.set_amounts_in(
+        {DIRECT: [2_000_000, 1_000_000], HOPPED: [1_330_000, 10**16, 1_000_000]}
+    )
+
+    path, amounts = toolkit._route_in(
+        1_000_000, TOKEN_A, TOKEN_B, label_in="USDC", label_out="USDT"
+    )
+
+    assert path == checksummed(*HOPPED)
+    assert amounts[0] == 1_330_000
+
+
+def test_route_in_breaks_an_exact_tie_towards_the_direct_pair(mock_web3, toolkit):
+    mock_web3.set_amounts_in(
+        {DIRECT: [1_005_000, 1_000_000], HOPPED: [1_005_000, 10**16, 1_000_000]}
+    )
+
+    path, _amounts = toolkit._route_in(
+        1_000_000, TOKEN_A, TOKEN_B, label_in="USDC", label_out="USDT"
+    )
+
+    assert path == checksummed(*DIRECT)
+
+
+def test_route_in_raises_the_usual_exception_when_every_candidate_reverts(mock_web3, toolkit):
+    mock_web3.set_amounts_in({})
+
+    with pytest.raises(ToolException, match="No Uniswap V2 liquidity path found"):
+        toolkit._route_in(1_000_000, TOKEN_A, TOKEN_B, label_in="USDC", label_out="USDT")
 
 
 def test_call_builds_account_agnostic_call_via_pure_encoding(mock_web3, toolkit):

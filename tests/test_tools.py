@@ -11,6 +11,8 @@ from langchain_core.tools import ToolException
 from web3.exceptions import ContractLogicError
 
 import langchain_uniswap_v2.toolkit as uvt
+from langchain_uniswap_v2.abis import erc20_abi, router_abi
+from langchain_uniswap_v2.networks import KNOWN_NETWORKS
 from tests.web3_mocks import (
     FACTORY,
     NATIVE_WRAPPED,
@@ -58,12 +60,11 @@ def tools(toolkit):
 def test_get_quote_out_computes_from_router_amounts(mock_web3, toolkit, tools):
     mock_web3.erc20(TOKEN_A).functions.decimals.return_value.call.return_value = 18
     mock_web3.erc20(TOKEN_B).functions.decimals.return_value.call.return_value = 6
-    # path routes through NATIVE_WRAPPED since toolkit fixture configures it
-    mock_web3.router.functions.getAmountsOut.return_value.call.return_value = [
-        10**18,
-        5 * 10**17,
-        2_500_000,
-    ]
+    # No direct TOKEN_A/TOKEN_B pool, so the only routable candidate is the
+    # hop through NATIVE_WRAPPED that the toolkit fixture configures.
+    mock_web3.set_amounts_out(
+        {(TOKEN_A, NATIVE_WRAPPED, TOKEN_B): [10**18, 5 * 10**17, 2_500_000]}
+    )
 
     result = tools["get_quote_out"].invoke(
         {"token_in": TOKEN_A, "token_out": TOKEN_B, "amount_in": 1}
@@ -515,6 +516,60 @@ def test_swap_exact_tokens_for_tokens_builds_unsigned_tx(mock_web3, toolkit, too
     mock_web3.w3.eth.get_transaction_count.assert_called_once_with(OWNER, "pending")
 
 
+def test_swap_exact_tokens_for_tokens_routes_around_a_dust_direct_pair(
+    mock_web3, toolkit, tools
+):
+    """End-to-end guard for the dust-pool bug. The direct pair quotes 34%
+    worse than the wrapped-native hop (the measured Avalanche USDC->USDT
+    case). The plan must swap on the better route *and* derive
+    amount_out_min from it -- deriving the bound from the bad quote is what
+    made the old behaviour silent: the swap filled "within tolerance" at a
+    materially worse price."""
+    mock_web3.erc20(TOKEN_A).functions.decimals.return_value.call.return_value = 6
+    mock_web3.erc20(TOKEN_A).functions.balanceOf.return_value.call.return_value = 10**30
+    mock_web3.erc20(TOKEN_A).encode_abi.return_value = "0xapprove"
+    # The direct pair exists and holds non-zero reserves on both sides -- the
+    # exact shape the old boolean check accepted. These are the measured
+    # reserves of that pair: under $1 a side.
+    mock_web3.factory.functions.getPair.return_value.call.return_value = PAIR
+    mock_web3.pair(PAIR).functions.getReserves.return_value.call.return_value = (
+        984_418,
+        983_066,
+        0,
+    )
+    mock_web3.set_amounts_out(
+        {
+            (TOKEN_A, TOKEN_B): [1_000_000, 495_672],
+            (TOKEN_A, NATIVE_WRAPPED, TOKEN_B): [1_000_000, 10**16, 750_485],
+        }
+    )
+    mock_web3.router.encode_abi.return_value = "0xdead"
+    mock_web3.w3.eth.get_transaction_count.return_value = 3
+    mock_web3.w3.eth.chain_id = 1
+    mock_web3.w3.eth.get_block.return_value = {}
+    mock_web3.w3.eth.gas_price = 1
+    mock_web3.w3.eth.estimate_gas.return_value = 21_000
+
+    tools["swap_exact_tokens_for_tokens"].invoke(
+        {
+            "token_in": TOKEN_A,
+            "token_out": TOKEN_B,
+            "amount_in": 1,
+            "from_address": OWNER,
+        }
+    )
+
+    _amount_in, amount_out_min, path, _to, _deadline = (
+        mock_web3.router.encode_abi.call_args.kwargs["args"]
+    )
+    assert [address.lower() for address in path] == [
+        TOKEN_A.lower(),
+        NATIVE_WRAPPED.lower(),
+        TOKEN_B.lower(),
+    ]
+    assert amount_out_min == 750_485 * 9950 // 10000
+
+
 def test_swap_exact_tokens_for_tokens_raises_on_no_liquidity(mock_web3, toolkit, tools):
     mock_web3.erc20(TOKEN_A).functions.decimals.return_value.call.return_value = 18
     mock_web3.erc20(TOKEN_A).functions.balanceOf.return_value.call.return_value = 10**30
@@ -848,6 +903,40 @@ def test_remove_liquidity_eth_builds_unsigned_tx(mock_web3, toolkit, tools):
     assert amount_token_min_arg == 100 * 9950 // 10000
     assert amount_eth_min_arg == 200 * 9950 // 10000
     assert to_arg.lower() == OWNER.lower()
+
+
+@pytest.mark.parametrize("chain_id", list(KNOWN_NETWORKS))
+def test_native_asset_swap_builds_a_plan_on_every_registry_chain(mock_web3, chain_id):
+    """Change 1, end to end: a toolkit built straight from a table entry must
+    be able to build a native-asset swap. While native_wrapped was None these
+    tools stayed registered and raised only once an agent had already picked
+    one, so this asserts against the registry itself rather than a fixture.
+
+    The test below covers the other seven tools' shared gate; this one carries
+    a plan all the way through routing and encoding, and checks the route
+    starts at the chain's own wrapped native."""
+    network = KNOWN_NETWORKS[chain_id]
+    router = mock_web3.contract_for(network["router"], router_abi)
+    router.functions.getAmountsOut.return_value.call.return_value = [10**16, 2_500_000]
+    router.encode_abi.return_value = "0xdead"
+    token_out = mock_web3.contract_for(TOKEN_B, erc20_abi)
+    token_out.functions.decimals.return_value.call.return_value = 6
+    mock_web3.w3.eth.get_balance.return_value = 10**24
+    mock_web3.w3.eth.chain_id = chain_id
+
+    # calls mode keeps this to the routing/encoding path -- no nonce, gas or
+    # fee lookups to mock, none of which this test is about.
+    toolkit = uvt.UniswapV2Toolkit.for_chain(chain_id=chain_id, tx_mode="calls")
+    tools = {t.name: t for t in toolkit.get_tools()}
+
+    plan = tools["swap_exact_eth_for_tokens"].invoke(
+        {"token_out": TOKEN_B, "amount_in": 0.01, "from_address": OWNER}
+    )
+
+    assert [call["role"] for call in plan["calls"]] == ["swap"]
+    _amount_out_min, path, _to, _deadline = router.encode_abi.call_args.kwargs["args"]
+    assert path[0].lower() == network["native_wrapped"].lower()
+    assert path[-1].lower() == TOKEN_B.lower()
 
 
 @pytest.mark.parametrize(

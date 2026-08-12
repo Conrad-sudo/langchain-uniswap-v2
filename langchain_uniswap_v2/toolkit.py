@@ -177,7 +177,10 @@ class UniswapV2Toolkit:
                 prototyping, but rate-limited; pass your own for production.
             **kwargs: Passed through to the main constructor (e.g. tx_mode,
                 estimate_gas, gas_buffer, default_gas, reset_residual_approvals,
-                preflight).
+                preflight). router_address, factory_address and
+                native_wrapped_address may be passed here too, each overriding
+                the registry's value for this chain -- the escape hatch for a
+                stale entry, or a fork/testnet reusing a known chain id.
 
         Raises:
             ValueError: If chain_id has no entry in KNOWN_NETWORKS, or if
@@ -200,13 +203,15 @@ class UniswapV2Toolkit:
                 f"('{network['name']}'). Pass rpc_url explicitly: "
                 f"UniswapV2Toolkit.for_chain({chain_id}, rpc_url=...)."
             )
-        return cls(
-            rpc_url=resolved_rpc_url,
-            router_address=network["router"],
-            factory_address=network["factory"],
-            native_wrapped_address=network["native_wrapped"],
-            **kwargs,
-        )
+        # setdefault, not explicit keywords: passing these positionally *and*
+        # splatting **kwargs raises TypeError ("multiple values for keyword
+        # argument") the moment a caller overrides one, which closes the only
+        # escape hatch for a stale registry entry. Absent an override, the
+        # registry's own values are supplied exactly as before.
+        kwargs.setdefault("router_address", network["router"])
+        kwargs.setdefault("factory_address", network["factory"])
+        kwargs.setdefault("native_wrapped_address", network["native_wrapped"])
+        return cls(rpc_url=resolved_rpc_url, **kwargs)
 
     # ---- internal helpers (not exposed as tools) ----
 
@@ -274,35 +279,95 @@ class UniswapV2Toolkit:
             return raw0, raw1
         return raw1, raw0
 
-    def _direct_pair_has_liquidity(self, token_a: str, token_b: str) -> bool:
+    def _candidate_paths(self, token_in: str, token_out: str) -> list[list[str]]:
         """
-        Whether a direct Uniswap V2 pair exists for token_a/token_b and has
-        non-zero reserves on both sides. Used by _build_path to prefer a
-        direct route over a wrapped-native hop when a liquid direct pool
-        exists -- routing USDC/DAI through WETH would otherwise pay the
-        0.3% fee twice and take two price impacts instead of one. Never
-        raises: a missing or dry pair just means "no", so _build_path can
-        fall back to the wrapped-native route.
-        """
-        try:
-            pair = self._pair(token_a, token_b)
-        except ToolException:
-            return False
-        reserve0, reserve1, _ = pair.functions.getReserves().call()
-        return reserve0 > 0 and reserve1 > 0
+        The routes worth quoting for token_in -> token_out, direct first.
 
-    def _build_path(self, token_in: str, token_out: str) -> list[str]:
+        Order is load-bearing: _route_out/_route_in keep the first path of an
+        exact tie, and a direct pair returning the same amount as a
+        wrapped-native hop is strictly preferable -- one pool instead of two,
+        so less gas and less that can move between quote and execution.
+        """
         token_in = Web3.to_checksum_address(token_in)
         token_out = Web3.to_checksum_address(token_out)
+        direct = [token_in, token_out]
         native_wrapped = self.native_wrapped_address
-        if (
-            native_wrapped is not None
-            and token_in != native_wrapped
-            and token_out != native_wrapped
-            and not self._direct_pair_has_liquidity(token_in, token_out)
-        ):
-            return [token_in, native_wrapped, token_out]
-        return [token_in, token_out]
+        if native_wrapped is None or native_wrapped in (token_in, token_out):
+            return [direct]
+        return [direct, [token_in, native_wrapped, token_out]]
+
+    # Route selection quotes every candidate and keeps the best fill, rather
+    # than picking a path first and quoting it afterwards.
+    #
+    # The old rule -- take the direct pair whenever it holds any non-zero
+    # reserves -- was right for a deep pool and backwards for a dust one,
+    # where a single hop's price impact dwarfs the second 0.3% fee it avoids.
+    # Measured on Avalanche, a USDC/USDT pair holding under $1 a side beat
+    # the WAVAX route on the old test while returning 34% less, and nothing
+    # downstream caught it: amount_out_min is derived from the same quote, so
+    # the swap fills "within tolerance" at a materially worse price.
+    #
+    # Selection returns the winning quote alongside the path, so callers
+    # never re-quote or re-select. That is what keeps a *ForExact swap's
+    # amount_in_max and its path derived from a single decision -- selecting
+    # twice could straddle a reserve change and cap the input using one route
+    # while executing another.
+    #
+    # Cost: this is one RPC call cheaper than before in the two-candidate
+    # case (two quotes, versus getPair + getReserves + one quote).
+
+    def _route_out(
+        self,
+        amount_in_base: int,
+        token_in: str,
+        token_out: str,
+        *,
+        label_in: str,
+        label_out: str,
+    ) -> tuple[list[str], list[int]]:
+        """The path returning the most token_out for amount_in_base, with the
+        quote that selected it. Raises if no candidate is routable."""
+        best_path: list[str] | None = None
+        best_amounts: list[int] | None = None
+        for path in self._candidate_paths(token_in, token_out):
+            try:
+                amounts = self._quote_amounts_out(
+                    amount_in_base, path, label_in=label_in, label_out=label_out
+                )
+            except ToolException:
+                continue  # unroutable candidate, not a failure while another remains
+            if best_amounts is None or amounts[-1] > best_amounts[-1]:
+                best_path, best_amounts = path, amounts
+        if best_path is None or best_amounts is None:
+            raise self._no_liquidity_path(label_in, label_out)
+        return best_path, best_amounts
+
+    def _route_in(
+        self,
+        amount_out_base: int,
+        token_in: str,
+        token_out: str,
+        *,
+        label_in: str,
+        label_out: str,
+    ) -> tuple[list[str], list[int]]:
+        """The path needing the least token_in to deliver amount_out_base,
+        with the quote that selected it -- the exact-output mirror of
+        _route_out. Raises if no candidate is routable."""
+        best_path: list[str] | None = None
+        best_amounts: list[int] | None = None
+        for path in self._candidate_paths(token_in, token_out):
+            try:
+                amounts = self._quote_amounts_in(
+                    amount_out_base, path, label_in=label_in, label_out=label_out
+                )
+            except ToolException:
+                continue
+            if best_amounts is None or amounts[0] < best_amounts[0]:
+                best_path, best_amounts = path, amounts
+        if best_path is None or best_amounts is None:
+            raise self._no_liquidity_path(label_in, label_out)
+        return best_path, best_amounts
 
     def _call(
         self,
@@ -482,13 +547,24 @@ class UniswapV2Toolkit:
     def _require_native_wrapped(self) -> str:
         if not self.native_wrapped_address:
             raise ToolException(
-                "This toolkit was not configured with a native_wrapped_address "
-                "(e.g. WETH), so native-asset swaps can't be built. Pass "
-                "native_wrapped_address to the constructor, or use "
-                "UniswapV2Toolkit.for_chain(...) for a chain that has one "
-                "registered."
+                "This toolkit has no native_wrapped_address configured, so "
+                "native-asset swaps can't be built. Pass "
+                "native_wrapped_address=... to the constructor or to "
+                "UniswapV2Toolkit.for_chain(chain_id, native_wrapped_address=...). "
+                "It must equal router.WETH() for the router in use; the router "
+                "rejects any other address with UniswapV2Router: INVALID_PATH."
             )
         return self.native_wrapped_address
+
+    @staticmethod
+    def _no_liquidity_path(label_in: str, label_out: str) -> ToolException:
+        """The one place this message is worded, so a single unroutable quote
+        and an exhausted route search report identically."""
+        return ToolException(
+            f"No Uniswap V2 liquidity path found for {label_in} -> "
+            f"{label_out}. The pool may not exist or have insufficient "
+            f"reserves."
+        )
 
     def _quote_amounts_out(
         self, amount_in_base: int, path: list[str], *, label_in: str, label_out: str
@@ -496,11 +572,7 @@ class UniswapV2Toolkit:
         try:
             return self.router.functions.getAmountsOut(amount_in_base, path).call()
         except ContractLogicError as err:
-            raise ToolException(
-                f"No Uniswap V2 liquidity path found for {label_in} -> "
-                f"{label_out}. The pool may not exist or have insufficient "
-                f"reserves."
-            ) from err
+            raise self._no_liquidity_path(label_in, label_out) from err
 
     def _quote_amounts_in(
         self, amount_out_base: int, path: list[str], *, label_in: str, label_out: str
@@ -508,11 +580,7 @@ class UniswapV2Toolkit:
         try:
             return self.router.functions.getAmountsIn(amount_out_base, path).call()
         except ContractLogicError as err:
-            raise ToolException(
-                f"No Uniswap V2 liquidity path found for {label_in} -> "
-                f"{label_out}. The pool may not exist or have insufficient "
-                f"reserves."
-            ) from err
+            raise self._no_liquidity_path(label_in, label_out) from err
 
     # ---- balance/allowance-independent sufficiency checks ----
     #
@@ -549,29 +617,37 @@ class UniswapV2Toolkit:
 
     def _derived_token_input_required(
         self, token_in: str, token_out: str, amount_out_base: int, slippage_bps: int
-    ) -> int:
+    ) -> tuple[int, list[str]]:
         """Required token_in, in base units, to receive amount_out_base of
         token_out via a *ForExactTokens swap -- a live quote (getAmountsIn)
-        plus a slippage buffer. Shared by is_derived_token_input_sufficient
-        and swap_tokens_for_exact_tokens/swap_tokens_for_exact_eth, so the
-        quote+buffer math is computed in exactly one place."""
-        path = self._build_path(token_in, token_out)
-        amounts = self._quote_amounts_in(
-            amount_out_base, path, label_in=token_in, label_out=token_out
+        plus a slippage buffer -- and the path that quote was taken on.
+        Shared by is_derived_token_input_sufficient and
+        swap_tokens_for_exact_tokens/swap_tokens_for_exact_eth, so the
+        quote+buffer math is computed in exactly one place.
+
+        The path is returned, not recomputed by callers: the swap must go out
+        on the same route the input cap was derived from."""
+        path, amounts = self._route_in(
+            amount_out_base, token_in, token_out, label_in=token_in, label_out=token_out
         )
-        return amounts[0] * (BPS_DENOMINATOR + slippage_bps) // BPS_DENOMINATOR
+        required = amounts[0] * (BPS_DENOMINATOR + slippage_bps) // BPS_DENOMINATOR
+        return required, path
 
     def _derived_native_input_required(
         self, token_out: str, amount_out_base: int, slippage_bps: int
-    ) -> int:
+    ) -> tuple[int, list[str]]:
         """Native-asset equivalent of _derived_token_input_required, for
         swap_eth_for_exact_tokens and is_derived_native_input_sufficient."""
         native_wrapped = self._require_native_wrapped()
-        path = self._build_path(native_wrapped, token_out)
-        amounts = self._quote_amounts_in(
-            amount_out_base, path, label_in="the native asset", label_out=token_out
+        path, amounts = self._route_in(
+            amount_out_base,
+            native_wrapped,
+            token_out,
+            label_in="the native asset",
+            label_out=token_out,
         )
-        return amounts[0] * (BPS_DENOMINATOR + slippage_bps) // BPS_DENOMINATOR
+        required = amounts[0] * (BPS_DENOMINATOR + slippage_bps) // BPS_DENOMINATOR
+        return required, path
 
     def _require_token_balance(
         self,
@@ -641,9 +717,10 @@ class UniswapV2Toolkit:
         def get_quote_in(token_in: str, token_out: str, amount_out: float) -> dict:
             """
             Returns how much of token_in is required to receive an exact amount
-            of token_out, via the Uniswap V2 router's getAmountsIn. Routes through
-            this toolkit's configured native-wrapped token when neither token is
-            that token and one was configured.
+            of token_out, via the Uniswap V2 router's getAmountsIn. Quotes both
+            the direct pool and the route through this toolkit's configured
+            native-wrapped token, and returns whichever needs less token_in;
+            the returned path says which one that was.
 
             Use this tool when the user wants to know the cost of acquiring a
             specific amount of a token (e.g. "how much USDC do I need to buy
@@ -665,10 +742,8 @@ class UniswapV2Toolkit:
             decimals_in = toolkit._decimals(token_in)
             decimals_out = toolkit._decimals(token_out)
             amount_out_base = toolkit._to_base_units(amount_out, decimals_out)
-            path = toolkit._build_path(token_in, token_out)
-
-            amounts = toolkit._quote_amounts_in(
-                amount_out_base, path, label_in=token_in, label_out=token_out
+            path, amounts = toolkit._route_in(
+                amount_out_base, token_in, token_out, label_in=token_in, label_out=token_out
             )
 
             return {
@@ -681,9 +756,10 @@ class UniswapV2Toolkit:
         def get_quote_out(token_in: str, token_out: str, amount_in: float) -> dict:
             """
             Returns how much of token_out will be received when spending an exact
-            amount of token_in, via the Uniswap V2 router's getAmountsOut. Routes
-            through this toolkit's configured native-wrapped token when neither
-            token is that token and one was configured.
+            amount of token_in, via the Uniswap V2 router's getAmountsOut. Quotes
+            both the direct pool and the route through this toolkit's configured
+            native-wrapped token, and returns whichever pays more token_out; the
+            returned path says which one that was.
 
             Use this tool when the user wants to know how much they'll receive
             for a given spend (e.g. "how much DAI will I get for 100 USDC?").
@@ -704,10 +780,8 @@ class UniswapV2Toolkit:
             decimals_in = toolkit._decimals(token_in)
             decimals_out = toolkit._decimals(token_out)
             amount_in_base = toolkit._to_base_units(amount_in, decimals_in)
-            path = toolkit._build_path(token_in, token_out)
-
-            amounts = toolkit._quote_amounts_out(
-                amount_in_base, path, label_in=token_in, label_out=token_out
+            path, amounts = toolkit._route_out(
+                amount_in_base, token_in, token_out, label_in=token_in, label_out=token_out
             )
 
             return {
@@ -898,7 +972,7 @@ class UniswapV2Toolkit:
             decimals_in = toolkit._decimals(token_in)
             decimals_out = toolkit._decimals(token_out)
             amount_out_base = toolkit._to_base_units(amount_out, decimals_out)
-            required_base = toolkit._derived_token_input_required(
+            required_base, _path = toolkit._derived_token_input_required(
                 token_in, token_out, amount_out_base, slippage_bps
             )
 
@@ -951,7 +1025,7 @@ class UniswapV2Toolkit:
             """
             decimals_out = toolkit._decimals(token_out)
             amount_out_base = toolkit._to_base_units(amount_out, decimals_out)
-            required_base = toolkit._derived_native_input_required(
+            required_base, _path = toolkit._derived_native_input_required(
                 token_out, amount_out_base, slippage_bps
             )
 
@@ -1215,10 +1289,8 @@ class UniswapV2Toolkit:
                     decimals=decimals_in,
                     purpose="this swap",
                 )
-            path = toolkit._build_path(token_in, token_out)
-
-            amounts = toolkit._quote_amounts_out(
-                amount_in_base, path, label_in=token_in, label_out=token_out
+            path, amounts = toolkit._route_out(
+                amount_in_base, token_in, token_out, label_in=token_in, label_out=token_out
             )
             amount_out_min = amounts[-1] * (BPS_DENOMINATOR - slippage_bps) // BPS_DENOMINATOR
             to = Web3.to_checksum_address(recipient or from_address)
@@ -1306,7 +1378,7 @@ class UniswapV2Toolkit:
             decimals_in = toolkit._decimals(token_in)
             decimals_out = toolkit._decimals(token_out)
             amount_out_base = toolkit._to_base_units(amount_out, decimals_out)
-            amount_in_max = toolkit._derived_token_input_required(
+            amount_in_max, path = toolkit._derived_token_input_required(
                 token_in, token_out, amount_out_base, slippage_bps
             )
             if toolkit.preflight:
@@ -1317,7 +1389,6 @@ class UniswapV2Toolkit:
                     decimals=decimals_in,
                     purpose="this swap",
                 )
-            path = toolkit._build_path(token_in, token_out)
             to = Web3.to_checksum_address(recipient or from_address)
 
             leading, trailing = toolkit._approval_calls(
@@ -1409,10 +1480,12 @@ class UniswapV2Toolkit:
                 toolkit._require_native_balance(
                     amount_in_base, from_address, purpose="this swap"
                 )
-            path = toolkit._build_path(native_wrapped, token_out)
-
-            amounts = toolkit._quote_amounts_out(
-                amount_in_base, path, label_in="the native asset", label_out=token_out
+            path, amounts = toolkit._route_out(
+                amount_in_base,
+                native_wrapped,
+                token_out,
+                label_in="the native asset",
+                label_out=token_out,
             )
             amount_out_min = amounts[-1] * (BPS_DENOMINATOR - slippage_bps) // BPS_DENOMINATOR
             to = Web3.to_checksum_address(recipient or from_address)
@@ -1492,17 +1565,18 @@ class UniswapV2Toolkit:
                     ignored in calls mode). If omitted, the current pending
                     transaction count for from_address is used.
             """
-            native_wrapped = toolkit._require_native_wrapped()
+            # Raises unless a native-wrapped address is configured; the route
+            # itself comes back from _derived_native_input_required below.
+            toolkit._require_native_wrapped()
             decimals_out = toolkit._decimals(token_out)
             amount_out_base = toolkit._to_base_units(amount_out, decimals_out)
-            amount_in_max = toolkit._derived_native_input_required(
+            amount_in_max, path = toolkit._derived_native_input_required(
                 token_out, amount_out_base, slippage_bps
             )
             if toolkit.preflight:
                 toolkit._require_native_balance(
                     amount_in_max, from_address, purpose="this swap"
                 )
-            path = toolkit._build_path(native_wrapped, token_out)
             to = Web3.to_checksum_address(recipient or from_address)
 
             action = toolkit._call(
@@ -1591,10 +1665,12 @@ class UniswapV2Toolkit:
                     decimals=decimals_in,
                     purpose="this swap",
                 )
-            path = toolkit._build_path(token_in, native_wrapped)
-
-            amounts = toolkit._quote_amounts_out(
-                amount_in_base, path, label_in=token_in, label_out="the native asset"
+            path, amounts = toolkit._route_out(
+                amount_in_base,
+                token_in,
+                native_wrapped,
+                label_in=token_in,
+                label_out="the native asset",
             )
             amount_out_min = amounts[-1] * (BPS_DENOMINATOR - slippage_bps) // BPS_DENOMINATOR
             to = Web3.to_checksum_address(recipient or from_address)
@@ -1683,7 +1759,7 @@ class UniswapV2Toolkit:
             native_wrapped = toolkit._require_native_wrapped()
             decimals_in = toolkit._decimals(token_in)
             amount_out_base = toolkit._to_base_units(amount_out, 18)
-            amount_in_max = toolkit._derived_token_input_required(
+            amount_in_max, path = toolkit._derived_token_input_required(
                 token_in, native_wrapped, amount_out_base, slippage_bps
             )
             if toolkit.preflight:
@@ -1694,7 +1770,6 @@ class UniswapV2Toolkit:
                     decimals=decimals_in,
                     purpose="this swap",
                 )
-            path = toolkit._build_path(token_in, native_wrapped)
             to = Web3.to_checksum_address(recipient or from_address)
 
             leading, trailing = toolkit._approval_calls(

@@ -28,5 +28,5 @@ htmlcov/
 .env.*
 
 # Internal session/dev notes, not for the public repo
-summary.md
-package_update.md
+uniswap-v2-spec-bump.md
+project_roadmap.md

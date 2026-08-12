@@ -1,0 +1,28 @@
+name: Verify networks
+
+# Checks KNOWN_NETWORKS against the live chains: every router still has
+# bytecode, and its WETH()/factory() still match what the table claims.
+#
+# Deliberately NOT run on pull_request. The test suite is fully mocked and
+# needs no network, and making every PR depend on 13 free public RPC
+# endpoints would trade real signal for flakiness -- endpoints rate-limit,
+# and a failing DNS lookup would block an unrelated PR. A registry entry
+# going stale is a slow event, so a weekly run catches it in time.
+on:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays, 06:17 UTC
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      # Unreachable endpoints are skipped, not failed; a mismatch fails.
+      # To pin a chain to a private endpoint, add a UNISWAP_V2_RPC_<chain_id>
+      # repository secret and pass it through in the env block below.
+      - run: python scripts/verify_native_wrapped.py

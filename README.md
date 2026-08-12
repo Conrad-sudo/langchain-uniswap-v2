@@ -170,6 +170,10 @@ signing.
 `UniswapV2Toolkit.for_chain(chain_id, rpc_url=None, **kwargs)` forwards
 `**kwargs` to the constructor, so e.g.
 `UniswapV2Toolkit.for_chain(1, tx_mode="calls", preflight=False)` works.
+`router_address`, `factory_address` and `native_wrapped_address` can be
+passed the same way, each overriding the registry's value for that chain —
+the escape hatch for a stale entry, or a fork or testnet reusing a known
+chain id.
 
 ## Tools
 
@@ -186,10 +190,19 @@ registry is assumed.
 | `get_lp_amounts(token_a, token_b, lp_amount)` | Expected token amounts redeemable for a given amount of LP tokens, before removing liquidity. |
 | `get_liquidity_token_balance(owner_address, token_a, token_b)` | An address's LP token balance for a given pair. |
 
-For a `token_in`/`token_out` pair, a direct pool is used when one exists and
-has liquidity; otherwise, if `native_wrapped_address` is configured, the
-quote routes through it (2-hop → 3-hop path), matching how Uniswap V2 pools
-are typically seeded.
+For a `token_in`/`token_out` pair, the direct pool and — when
+`native_wrapped_address` is configured — the route through the wrapped
+native are both quoted, and the better fill wins: more `token_out` for an
+exact-input quote, less `token_in` for an exact-output one. An exact tie
+goes to the direct pool, since one hop costs less gas than two. A route that
+reverts is skipped; if none is routable the tool raises `ToolException`.
+
+Comparing beats assuming in both directions. Routing a liquid USDC/DAI pair
+through WETH would pay the 0.3% fee twice and take two price impacts instead
+of one, so the direct pool usually wins — but a direct pool holding dust
+loses badly, and picking it on the strength of merely existing is a silent
+error, because `amount_out_min` is derived from the same quote and the swap
+then fills "within tolerance" at a much worse price.
 
 Balance-sufficiency checks answer "does this address hold enough" before a
 write tool would actually be called, given an explicit `owner_address` —
@@ -253,21 +266,29 @@ network.
 All addresses are Uniswap Labs' own official V2 redeployments, except BSC,
 which deliberately uses PancakeSwap — see the note below.
 
-| chain_id | name | native_token |
-|---|---|---|
-| 1 | mainnet | ETH |
-| 11155111 | sepolia | ETH |
-| 130 | unichain | ETH |
-| 42161 | arbitrum | ETH |
-| 43114 | avalanche | AVAX |
-| 56 | bsc (PancakeSwap V2) | BNB |
-| 8453 | base | ETH |
-| 10 | optimism | ETH |
-| 137 | polygon | POL |
-| 7777777 | zora | ETH |
-| 480 | worldchain | ETH |
-| 143 | monad | MON |
-| 196 | x-layer | OKB |
+| chain_id | name | native_token | wrapped native |
+|---|---|---|---|
+| 1 | mainnet | ETH | WETH |
+| 11155111 | sepolia | ETH | WETH |
+| 130 | unichain | ETH | WETH |
+| 42161 | arbitrum | ETH | WETH |
+| 43114 | avalanche | AVAX | WAVAX |
+| 56 | bsc (PancakeSwap V2) | BNB | WBNB |
+| 8453 | base | ETH | WETH |
+| 10 | optimism | ETH | WETH |
+| 137 | polygon | POL | WPOL |
+| 7777777 | zora | ETH | WETH |
+| 480 | worldchain | ETH | WETH |
+| 143 | monad | MON | WMON |
+| 196 | x-layer | OKB | WOKB |
+
+Every chain has a wrapped-native address registered, so the native-asset
+swap and liquidity tools work on all of them. Each address is the one that
+chain's own router returns from `WETH()` — the router rejects any other
+address in its `*ETH`-suffixed functions with `UniswapV2Router:
+INVALID_PATH`, so the router is the only authority on this, not a token list
+or explorer page. `scripts/verify_native_wrapped.py` re-checks every entry
+against its live router (weekly in CI, and runnable locally).
 
 **Why BSC uses PancakeSwap, not Uniswap Labs' own BSC redeployment:** the
 official Uniswap Labs BSC contracts exist and respond to calls, but were
@@ -277,6 +298,42 @@ registry points there instead.
 
 For any chain not listed here, instantiate `UniswapV2Toolkit(...)` directly
 with explicit `router_address` / `factory_address` / `native_wrapped_address`.
+
+## Migration (0.3.0 → 0.4.0)
+
+No API change: nothing renamed, no signature removed, no return shape
+altered. Existing code keeps working as written. It is a minor rather than a
+patch because observable behaviour changes for existing callers.
+
+**Added**
+
+- `native_wrapped` is now populated for all supported chains (previously
+  `None` on 10 of 13), enabling the native-asset swap and liquidity tools
+  and wrapped-native multi-hop routing on Optimism, Polygon, Base, Arbitrum,
+  Avalanche, Unichain, Monad, X Layer, World Chain and Zora. Every value is
+  verified equal to the chain router's own `WETH()`.
+
+**Fixed**
+
+- `for_chain()` no longer raises `TypeError` when a caller overrides
+  `router_address`, `factory_address` or `native_wrapped_address`.
+- Route selection no longer prefers a direct pair holding negligible
+  reserves over a wrapped-native route that quotes better. Previously this
+  could select a materially worse price with no error at all.
+
+What this means in practice:
+
+| behaviour | 0.3.0 | 0.4.0 |
+|---|---|---|
+| eight native-asset tools on 10 of the 13 chains | raise `ToolException` when invoked | build plans |
+| token→token pairs with no direct pool, on those chains | raise "no liquidity path" | route through the wrapped native |
+| direct pool holding dust, better route available | silently takes the dust pool | takes the better route |
+| `for_chain(cid, native_wrapped_address=...)` | `TypeError` | override applied |
+
+If you pinned around any of that — for example, passing
+`native_wrapped_address` explicitly to work around the missing registry
+values, or hard-coding a path you expected the toolkit to produce — the
+workarounds still function, but are no longer needed.
 
 ## Migration (0.2.0 → 0.3.0)
 
@@ -324,6 +381,20 @@ lint/format never churns it.
 
 CI (`.github/workflows/ci.yml`) runs `ruff check`/`ruff format --check` and
 the test suite (Python 3.10–3.12) on every push and pull request.
+
+`scripts/verify_native_wrapped.py` checks the registry against the live
+chains — router bytecode present, `WETH()` and `factory()` matching the
+table — and reports each wrapped native's symbol and decimals. It runs
+weekly via `.github/workflows/verify-networks.yml` rather than on pull
+requests, so PR CI stays offline and deterministic. An unreachable endpoint
+is a skip; a mismatch fails. Point it at your own endpoints with
+`UNISWAP_V2_RPC_<chain_id>`:
+
+```bash
+python scripts/verify_native_wrapped.py            # every entry
+python scripts/verify_native_wrapped.py --chain 1  # just one
+UNISWAP_V2_RPC_137=https://your-endpoint python scripts/verify_native_wrapped.py --chain 137
+```
 
 ## License
 

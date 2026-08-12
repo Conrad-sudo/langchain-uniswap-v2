@@ -43,10 +43,17 @@ def test_router_and_factory_are_valid_addresses(chain_id):
 
 
 @pytest.mark.parametrize("chain_id", list(KNOWN_NETWORKS))
-def test_native_wrapped_is_a_valid_address_or_none(chain_id):
+def test_native_wrapped_is_a_valid_address(chain_id):
+    """Every supported chain has a resolvable wrapped native (it is whatever
+    that chain's router returns from WETH()), so None is a gap that disables
+    eight tools on the chain -- not a legitimate state. scripts/
+    verify_native_wrapped.py checks the values against the live routers;
+    this only guards the shape, offline."""
     native_wrapped = KNOWN_NETWORKS[chain_id]["native_wrapped"]
-    if native_wrapped is None:
-        return
+    assert native_wrapped is not None, (
+        f"native_wrapped is None on chain {chain_id} -- fill it from that "
+        f"chain's router.WETH()"
+    )
     assert isinstance(native_wrapped, str)
     assert ADDRESS_RE.match(native_wrapped), (
         f"native_wrapped on chain {chain_id} is not a valid address: {native_wrapped}"

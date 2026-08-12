@@ -32,11 +32,11 @@ def mock_web3(monkeypatch):
 
     env = Web3Env(mock_w3_cls, w3_instance)
     w3_instance.eth.contract.side_effect = env._contract_side_effect
-    # _build_path calls factory.getPair to check for a direct pair before
-    # falling back to a wrapped-native hop. Default to "no direct pair" so
-    # existing tests that never configured this keep routing through
-    # native_wrapped as before; a test exercising the direct-pair path sets
-    # env.factory.functions.getPair(...).call.return_value explicitly.
+    # Pair lookups default to "no pair exists"; a test that needs one sets
+    # env.factory.functions.getPair(...).call.return_value explicitly. This
+    # reaches only the pool/LP tools -- route selection compares router
+    # quotes and never reads a pair, so a test about which route wins
+    # configures Web3Env.set_amounts_out/set_amounts_in instead.
     env.factory.functions.getPair.return_value.call.return_value = ZERO_ADDRESS
 
     monkeypatch.setattr(uvt, "Web3", mock_w3_cls)
