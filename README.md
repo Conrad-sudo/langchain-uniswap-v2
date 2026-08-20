@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/Conrad-sudo/langchain-uniswap-v2/actions/workflows/ci.yml/badge.svg)](https://github.com/Conrad-sudo/langchain-uniswap-v2/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/langchain-uniswap-v2)](https://pypi.org/project/langchain-uniswap-v2/)
+[![Python](https://img.shields.io/pypi/pyversions/langchain-uniswap-v2)](https://pypi.org/project/langchain-uniswap-v2/)
+[![License](https://img.shields.io/pypi/l/langchain-uniswap-v2)](https://github.com/Conrad-sudo/langchain-uniswap-v2/blob/main/LICENSE)
 
 [LangChain](https://www.langchain.com/) tools for Uniswap V2 (and
 Uniswap-V2-shaped forks, e.g. PancakeSwap): live swap quotes, liquidity
