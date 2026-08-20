@@ -540,12 +540,12 @@ def test_render_eoa_assigns_sequential_nonces_and_shared_fees(mock_web3, toolkit
         {"to": TOKEN_A, "value": 0, "data": "0x1", "role": "approve"},
         {"to": ROUTER, "value": 0, "data": "0x2", "role": "swap"},
     ]
-    txs = toolkit._render_eoa(calls, TOKEN_A)
+    txs, estimated = toolkit._render_eoa(calls, TOKEN_A)
 
     assert [tx["nonce"] for tx in txs] == [5, 6]
     assert all(tx["chainId"] == 1 for tx in txs)
     assert all(tx["maxFeePerGas"] == 201 for tx in txs)  # 100*2 + 1, shared across both
-    assert all(tx["gas_estimated"] is True for tx in txs)
+    assert estimated == [True, True]
     mock_web3.w3.eth.get_transaction_count.assert_called_once_with(
         RealWeb3.to_checksum_address(TOKEN_A), "pending"
     )
@@ -560,10 +560,60 @@ def test_render_eoa_respects_explicit_starting_nonce(mock_web3, toolkit):
         {"to": TOKEN_A, "value": 0, "data": "0x1", "role": "approve"},
         {"to": ROUTER, "value": 0, "data": "0x2", "role": "swap"},
     ]
-    txs = toolkit._render_eoa(calls, TOKEN_A, nonce=42)
+    txs, _ = toolkit._render_eoa(calls, TOKEN_A, nonce=42)
 
     assert [tx["nonce"] for tx in txs] == [42, 43]
     mock_web3.w3.eth.get_transaction_count.assert_not_called()
+
+
+def test_render_eoa_emits_no_field_a_transaction_does_not_have(mock_web3, toolkit):
+    """The rendered dict has to be signable exactly as returned.
+
+    eth_account validates the dict it is handed and raises `TypeError: Unknown
+    kwargs` on anything it does not recognise, so a single piece of metadata
+    tucked in beside the real fields breaks the first thing every EOA consumer
+    does. `gas_estimated` used to live here and did exactly that; it travels
+    alongside now.
+    """
+    mock_web3.w3.eth.get_transaction_count.return_value = 5
+    mock_web3.w3.eth.chain_id = 1
+    mock_web3.w3.eth.get_block.return_value = {"baseFeePerGas": 100}
+    mock_web3.w3.eth.max_priority_fee = 1
+    mock_web3.w3.eth.estimate_gas.return_value = 21_000
+
+    calls = [{"to": ROUTER, "value": 0, "data": "0x1", "role": "swap"}]
+    txs, estimated = toolkit._render_eoa(calls, TOKEN_A)
+
+    assert set(txs[0]) == {
+        "from",
+        "to",
+        "value",
+        "data",
+        "nonce",
+        "chainId",
+        "gas",
+        "maxFeePerGas",
+        "maxPriorityFeePerGas",
+    }
+    assert estimated == [True]
+
+
+def test_eth_account_signs_the_rendered_dict_exactly_as_returned(mock_web3, toolkit):
+    """The README's flow, run for real rather than asserted about."""
+    from eth_account import Account
+
+    mock_web3.w3.eth.get_transaction_count.return_value = 5
+    mock_web3.w3.eth.chain_id = 1
+    mock_web3.w3.eth.get_block.return_value = {"baseFeePerGas": 100}
+    mock_web3.w3.eth.max_priority_fee = 1
+    mock_web3.w3.eth.estimate_gas.return_value = 21_000
+
+    account = Account.from_key("0x" + "11" * 32)
+    calls = [{"to": ROUTER, "value": 0, "data": "0x1", "role": "swap"}]
+    txs, _ = toolkit._render_eoa(calls, account.address)
+
+    signed = account.sign_transaction(txs[0])
+    assert signed.raw_transaction
 
 
 def test_plan_renders_transactions_in_eoa_mode(mock_web3, toolkit):
@@ -581,6 +631,26 @@ def test_plan_renders_transactions_in_eoa_mode(mock_web3, toolkit):
     assert len(plan["transactions"]) == 1
 
 
+def test_plan_carries_gas_provenance_beside_the_transactions(mock_web3, toolkit):
+    mock_web3.w3.eth.get_transaction_count.return_value = 5
+    mock_web3.w3.eth.chain_id = 1
+    mock_web3.w3.eth.get_block.return_value = {"baseFeePerGas": 100}
+    mock_web3.w3.eth.max_priority_fee = 1
+    mock_web3.w3.eth.estimate_gas.side_effect = [
+        21_000,
+        ContractLogicError("execution reverted"),
+    ]
+
+    calls = [
+        {"to": TOKEN_A, "value": 0, "data": "0x1", "role": "approve"},
+        {"to": ROUTER, "value": 0, "data": "0x2", "role": "swap"},
+    ]
+    plan = toolkit._plan(calls, from_address=TOKEN_A, summary={})
+
+    assert plan["gas_estimated"] == [True, False]
+    assert len(plan["gas_estimated"]) == len(plan["transactions"])
+
+
 def test_plan_calls_mode_makes_no_eoa_rpc_calls(mock_web3):
     toolkit = uvt.UniswapV2Toolkit(
         rpc_url="http://fake-rpc",
@@ -594,5 +664,7 @@ def test_plan_calls_mode_makes_no_eoa_rpc_calls(mock_web3):
 
     assert plan["calls"] is calls
     assert plan["transactions"] is None
+    # Nothing was estimated, so claiming [] or [False] would both be untrue.
+    assert plan["gas_estimated"] is None
     mock_web3.w3.eth.get_transaction_count.assert_not_called()
     mock_web3.w3.eth.estimate_gas.assert_not_called()

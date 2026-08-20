@@ -1042,9 +1042,8 @@ def test_write_tools_build_when_allowance_is_not_standing(mock_web3, toolkit, to
     assert [c["role"] for c in plan["calls"]] == ["approve", "swap"]
     approve_tx, swap_tx = plan["transactions"]
     assert approve_tx["gas"] == int(60_000 * toolkit.gas_buffer)
-    assert approve_tx["gas_estimated"] is True
     assert swap_tx["gas"] == uvt.DEFAULT_GAS["swap"]
-    assert swap_tx["gas_estimated"] is False
+    assert plan["gas_estimated"] == [True, False]
 
 
 def test_calls_mode_write_tool_makes_no_nonce_gas_or_fee_requests(mock_web3):

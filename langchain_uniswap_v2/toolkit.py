@@ -409,15 +409,23 @@ class UniswapV2Toolkit:
         calls. calls is always populated; transactions is only rendered in
         "eoa" tx_mode (see _render_eoa) and is None in "calls" mode, where a
         smart-contract wallet's own batch executor consumes calls directly.
+
+        gas_estimated pairs index-for-index with transactions: True where the
+        gas limit came from a live estimate, False where it fell back to
+        DEFAULT_GAS because the call's prerequisite is earlier in this same
+        plan and not mined yet. None in calls mode, where nothing is estimated.
         """
-        plan = {
+        plan: dict = {
             "calls": calls,
             "transactions": None,
+            "gas_estimated": None,
             "chain_id": self.w3.eth.chain_id,
             "summary": summary,
         }
         if self.tx_mode == "eoa":
-            plan["transactions"] = self._render_eoa(calls, from_address, nonce)
+            plan["transactions"], plan["gas_estimated"] = self._render_eoa(
+                calls, from_address, nonce
+            )
         return plan
 
     def _fee_params(self) -> dict:
@@ -474,9 +482,18 @@ class UniswapV2Toolkit:
 
     def _render_eoa(
         self, calls: list[dict], from_address: str, nonce: int | None = None
-    ) -> list[dict]:
+    ) -> tuple[list[dict], list[bool]]:
         """Renders calls as unsigned, signable EOA transactions with
-        sequential nonces and one shared fee snapshot."""
+        sequential nonces and one shared fee snapshot.
+
+        Returns (transactions, gas_estimated). Each transaction dict holds
+        transaction fields and nothing else, so it can be signed exactly as
+        returned -- eth_account rejects any unknown key with `TypeError:
+        Unknown kwargs`, and "did this limit come from a live estimate" is not
+        a field an Ethereum transaction has. That provenance travels alongside
+        instead, one bool per transaction, and reaches the caller as
+        plan["gas_estimated"].
+        """
         sender = Web3.to_checksum_address(from_address)
         base_nonce = (
             nonce
@@ -487,6 +504,7 @@ class UniswapV2Toolkit:
         chain_id = self.w3.eth.chain_id
 
         txs = []
+        estimated_flags = []
         for index, call in enumerate(calls):
             gas, estimated = self._gas_for(call, sender, has_pending_prerequisite=index > 0)
             txs.append(
@@ -498,11 +516,11 @@ class UniswapV2Toolkit:
                     "nonce": base_nonce + index,
                     "chainId": chain_id,
                     "gas": gas,
-                    "gas_estimated": estimated,
                     **fees,
                 }
             )
-        return txs
+            estimated_flags.append(estimated)
+        return txs, estimated_flags
 
     def _approval_calls(
         self, spender: str, approvals: list[tuple[Contract, int, str]]

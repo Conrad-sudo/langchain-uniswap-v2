@@ -125,6 +125,7 @@ Every write tool returns a **plan**, not a bare transaction:
         },
     ],
     "transactions": [...] | None,  # EOA mode only; same calls, signable, nonces assigned
+    "gas_estimated": [...] | None,  # EOA mode only; per tx, live estimate or DEFAULT_GAS
     "chain_id": 1,
     "summary": {...},  # amounts in whole units, safe to show a user
 }
@@ -144,17 +145,21 @@ order — if your account supports batching, execute them atomically in one
 transaction. That atomicity is what makes the approve → action → reset
 sequence safe for accounts that reject standing approvals.
 
-**`gas_estimated` caveat (EOA mode):** a call whose prerequisite approval is
-earlier in the same plan can't be simulated yet — the allowance isn't
-on-chain until that earlier call is mined. For those, the transaction's
-`gas` field falls back to a static per-role default (`DEFAULT_GAS`) and
-`gas_estimated` is set to `False`, flagging that the limit wasn't derived
+**`gas_estimated` (EOA mode):** a call whose prerequisite approval is earlier
+in the same plan can't be simulated yet — the allowance isn't on-chain until
+that earlier call is mined. For those, the transaction's `gas` field falls
+back to a static per-role default (`DEFAULT_GAS`) and the matching entry in
+`plan["gas_estimated"]` is `False`, flagging that the limit wasn't derived
 from a live simulation and should be sanity-checked before broadcast. Only
 the **first** call in a plan has its revert treated as fatal — if that one
 fails to estimate, the tool raises `ToolException` instead of returning a
-plan that would fail on-chain. `gas_estimated` is metadata, not a
-transaction field — pop it (or move it into a parallel list) before
-signing.
+plan that would fail on-chain.
+
+The flags live on the plan, index for index with `transactions`, rather than
+inside the transaction dicts: a transaction dict holds transaction fields and
+nothing else, so it signs exactly as returned. `eth_account` validates its
+input and rejects an unrecognised key with `TypeError: Unknown kwargs`, so a
+stray flag would break the first thing every EOA consumer does.
 
 **Constructor options**, all keyword-only:
 
@@ -299,6 +304,33 @@ registry points there instead.
 For any chain not listed here, instantiate `UniswapV2Toolkit(...)` directly
 with explicit `router_address` / `factory_address` / `native_wrapped_address`.
 
+## Migration (0.4.0 → 0.5.0)
+
+One shape change, in the EOA path only. `calls` mode is untouched.
+
+**Changed**
+
+- `gas_estimated` moved out of each transaction dict and onto the plan as
+  `plan["gas_estimated"]` — a list of one bool per transaction, index for
+  index with `plan["transactions"]`, and `None` in calls mode.
+
+Why: a transaction dict now holds transaction fields and nothing else, so it
+signs exactly as returned. Previously
+`eth_account.sign_transaction(plan["transactions"][0])` raised
+`TypeError: Unknown kwargs: ['gas_estimated']`, and this README told callers
+to pop the key first.
+
+| behaviour | 0.4.0 | 0.5.0 |
+|---|---|---|
+| `acct.sign_transaction(plan["transactions"][0])` | `TypeError: Unknown kwargs` | signs |
+| reading the flag | `plan["transactions"][i]["gas_estimated"]` | `plan["gas_estimated"][i]` |
+| `tx.pop("gas_estimated")` in a signing loop | required | `KeyError` — delete the line |
+| calls mode | unaffected | unaffected |
+
+If your signing loop used the tolerant `tx.pop("gas_estimated", None)`, it
+keeps working as written; the strict `tx.pop("gas_estimated")` now raises and
+the line should simply be removed.
+
 ## Migration (0.3.0 → 0.4.0)
 
 No API change: nothing renamed, no signature removed, no return shape
@@ -347,7 +379,7 @@ of a bare transaction dict:
 | caller calls `approve_token` separately | approval is `plan["calls"][0]`, already sized |
 | caller manages `nonce` collisions | nonces pre-assigned across the plan |
 | caller re-quotes to describe the swap | `plan["summary"]` |
-| build raises when allowance missing | builds fine; `gas_estimated: False` flags fallbacks |
+| build raises when allowance missing | builds fine; `plan["gas_estimated"]` flags fallbacks |
 
 Minimal EOA diff:
 
@@ -357,7 +389,6 @@ Minimal EOA diff:
 -w3.eth.send_raw_transaction(signed.raw_transaction)
 +plan = tools["swap_exact_tokens_for_tokens"].invoke({...})
 +for tx in plan["transactions"]:
-+    tx.pop("gas_estimated", None)
 +    signed = acct.sign_transaction(tx)
 +    w3.eth.send_raw_transaction(signed.raw_transaction)
 ```
